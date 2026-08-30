@@ -1,0 +1,40 @@
+---
+import '../styles/global.css';
+const { title = 'tsdocode', description = 'Clean. Technical. Minimal.' } = Astro.props;
+const path = Astro.url.pathname;
+const baseUrl = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <link rel="icon" href={`${baseUrl}favicon.svg`} />
+    <meta name="description" content={description} />
+    <title>{title} · tsdocode</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="shell nav">
+        <a class="brand" href={baseUrl}><span class="brand-mark mono">&lt;/&gt;</span> tsdocode</a>
+        <nav class="nav-links" aria-label="Main navigation">
+          <a class={path === '/blog' || path === '/blog/' ? 'active' : ''} href={baseUrl}>Blog</a>
+          <a class={path.includes('/projects') || path.includes('/project') ? 'active' : ''} href={`${baseUrl}projects/`}>Projects</a>
+        </nav>
+        <div class="nav-actions"><a class="nav-mark" href="https://github.com/tsdocode" aria-label="GitHub">GH</a><a class="nav-mark nav-x" href="https://x.com/tsdocode" aria-label="X">X</a><a class="mail-mark" href="mailto:hello@tsdocode.dev" aria-label="Email"></a><button class="icon-button" aria-label="Toggle theme" id="theme-toggle"><span class="theme-mark"></span></button><span class="mobile-menu" aria-hidden="true">MENU</span></div>
+      </div>
+    </header>
+    <main><slot /></main>
+    <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span>Built with Astro · Markdown · GitHub Pages</span></div></footer>
+    <script is:inline>
+      const toggle = document.querySelector('#theme-toggle');
+      const savedTheme = localStorage.getItem('tsdocode-theme');
+      if (savedTheme === 'dim') document.documentElement.classList.add('dim');
+      toggle?.addEventListener('click', () => {
+        const isDim = document.documentElement.classList.toggle('dim');
+        localStorage.setItem('tsdocode-theme', isDim ? 'dim' : 'light');
+        document.dispatchEvent(new CustomEvent('tsdocode:theme-change'));
+      });
+    </script>
+  </body>
+</html>

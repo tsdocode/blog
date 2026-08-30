@@ -1,0 +1,56 @@
+---
+interface Props {
+  chart: string;
+  title?: string;
+}
+
+const { chart, title = 'Mermaid diagram' } = Astro.props;
+---
+
+<figure class="mermaid-frame">
+  <div class="mermaid" data-chart={chart} role="img" aria-label={title}>{chart}</div>
+</figure>
+
+<script>
+  import mermaid from 'mermaid';
+
+  const diagrams = document.querySelectorAll('.mermaid[data-chart]');
+  const renderDiagrams = async () => {
+    const isDim = document.documentElement.classList.contains('dim');
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      theme: 'base',
+      themeVariables: isDim ? {
+        background: '#101a20',
+        primaryColor: '#1d1b3c',
+        primaryTextColor: '#f2f4f5',
+        primaryBorderColor: '#8b82ff',
+        lineColor: '#8b82ff',
+        secondaryColor: '#15352d',
+        tertiaryColor: '#152128',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+      } : {
+        background: '#ffffff',
+        primaryColor: '#eeedff',
+        primaryTextColor: '#111318',
+        primaryBorderColor: '#5146f5',
+        lineColor: '#5146f5',
+        secondaryColor: '#effaf5',
+        tertiaryColor: '#f3f4f6',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+      },
+      flowchart: { useMaxWidth: true, htmlLabels: false }
+    });
+
+    diagrams.forEach((diagram) => {
+      diagram.removeAttribute('data-processed');
+      diagram.innerHTML = '';
+      diagram.textContent = diagram.getAttribute('data-chart') ?? '';
+    });
+    if (diagrams.length) await mermaid.run({ nodes: diagrams });
+  };
+
+  renderDiagrams();
+  document.addEventListener('tsdocode:theme-change', renderDiagrams);
+</script>
