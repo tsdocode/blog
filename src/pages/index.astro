@@ -13,14 +13,13 @@ const baseUrl = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_UR
       <p>Technical writing on systems, AI infrastructure, and the quiet details that make software reliable.</p>
     </section>
     <section class="default-welcome">
-      <div class="welcome-number mono">00</div>
+      <div class="welcome-number mono">00 / published notes</div>
       <div>
-        <span class="post-kicker">The notebook is open</span>
+        <span class="post-kicker">The notebook is open</span><span class="welcome-status">First note in progress.</span>
         <h2>No posts published yet.</h2>
-        <p>Add your first Markdown or MDX file to <code>src/content/posts/</code> and it will appear here automatically.</p>
-        <div class="welcome-actions"><span class="button button-primary">Start writing</span><span class="mono welcome-path">/src/content/posts/</span></div>
+        <p class="manifesto">Notes from building things close to the metal.<br />Benchmarks, failures, internals, and lessons worth keeping.</p>
       </div>
     </section>
-    <section class="topic-strip"><span class="post-kicker">Planned topics</span><div class="rail-list"><span>Systems</span><span>AI infrastructure</span><span>Linux</span><span>Open source</span></div></section>
+    <section class="topic-strip"><span class="post-kicker">Planned territory</span><div class="rail-list"><span>AI Runtime</span><span>GPU Systems</span><span>Linux</span><span>Inference</span><span>Open Source</span></div></section>
   </div>
 </BaseLayout>
