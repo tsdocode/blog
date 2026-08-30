@@ -19,7 +19,6 @@ const baseUrl = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_UR
         <a class="brand" href={baseUrl}><span class="brand-mark mono">&lt;/&gt;</span> tsdocode</a>
         <nav class="nav-links" aria-label="Main navigation">
           <a class={path === '/blog' || path === '/blog/' ? 'active' : ''} href={baseUrl}>Blog</a>
-          <a class={path.includes('/projects') || path.includes('/project') ? 'active' : ''} href={`${baseUrl}projects/`}>Projects</a>
         </nav>
         <div class="nav-actions"><a class="nav-mark" href="https://github.com/tsdocode" aria-label="GitHub">GH</a><a class="nav-mark nav-x" href="https://x.com/tsdocode" aria-label="X">X</a><a class="mail-mark" href="mailto:hello@tsdocode.dev" aria-label="Email"></a><button class="icon-button" aria-label="Toggle theme" id="theme-toggle"><span class="theme-mark"></span></button><span class="mobile-menu" aria-hidden="true">MENU</span></div>
       </div>
