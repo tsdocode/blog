@@ -37,7 +37,7 @@ const socialImage = Astro.site ? new URL(`${baseUrl}og-card.svg`, Astro.site).to
       </div>
     </header>
     <main><slot /></main>
-    <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span><a href={`${baseUrl}rss.xml`}>RSS ↗</a><span class="footer-dot">·</span> Built with Astro · Markdown · GitHub Pages</span></div></footer>
+    <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span><a href={`${baseUrl}rss.xml`}>RSS ↗</a></span></div></footer>
     <script is:inline>
       const toggle = document.querySelector('#theme-toggle');
       const savedTheme = localStorage.getItem('tsdocode-theme');
@@ -46,6 +46,26 @@ const socialImage = Astro.site ? new URL(`${baseUrl}og-card.svg`, Astro.site).to
         const isDim = document.documentElement.classList.toggle('dim');
         localStorage.setItem('tsdocode-theme', isDim ? 'dim' : 'light');
         document.dispatchEvent(new CustomEvent('tsdocode:theme-change'));
+      });
+
+      document.querySelectorAll('pre.astro-code').forEach((block) => {
+        const code = block.querySelector('code');
+        if (!code || block.querySelector('.copy-code')) return;
+        const copyButton = document.createElement('button');
+        copyButton.className = 'copy-code';
+        copyButton.type = 'button';
+        copyButton.textContent = 'Copy';
+        copyButton.setAttribute('aria-label', 'Copy code to clipboard');
+        copyButton.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(code.textContent ?? '');
+          copyButton.textContent = 'Copied';
+          copyButton.classList.add('is-copied');
+          window.setTimeout(() => {
+            copyButton.textContent = 'Copy';
+            copyButton.classList.remove('is-copied');
+          }, 1600);
+        });
+        block.append(copyButton);
       });
     </script>
   </body>

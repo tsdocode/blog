@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><link rel="icon" href="/blog/favicon.svg"><meta name="description" content="This note does not exist yet."><link rel="canonical" href="https://tsdocode.github.io/blog/404/"><meta property="og:type" content="website"><meta property="og:site_name" content="tsdocode"><meta property="og:title" content="404"><meta property="og:description" content="This note does not exist yet."><meta property="og:url" content="https://tsdocode.github.io/blog/404/"><meta property="og:image" content="https://tsdocode.github.io/blog/og-card.svg"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="404"><meta name="twitter:description" content="This note does not exist yet."><meta name="twitter:image" content="https://tsdocode.github.io/blog/og-card.svg"><title>404 · tsdocode</title><link rel="stylesheet" href="/blog/_astro/BaseLayout.K_B0RZn3.css"></head> <body> <header class="site-header"> <div class="shell nav"> <a class="brand" href="/blog/"><span class="brand-mark mono">&lt;/&gt;</span> tsdocode</a> <nav class="nav-links" aria-label="Main navigation"> <a class href="/blog/">Blog</a> </nav> <div class="nav-actions"><a class="nav-mark" href="https://github.com/tsdocode" aria-label="GitHub">GH</a><a class="nav-mark nav-x" href="https://x.com/tsdocode" aria-label="X">X</a><a class="rss-mark" href="/blog/rss.xml">RSS <span>↗</span></a><button class="icon-button" aria-label="Toggle theme" id="theme-toggle"><span class="theme-mark"></span></button><span class="mobile-menu" aria-hidden="true">MENU</span></div> </div> </header> <main> <div class="shell not-found"><div class="not-found-code mono">404</div><div><span class="post-kicker">A quiet dead end</span><h1>This note does not exist yet.</h1><p>The page you’re looking for may have moved, or it has not been written.</p><a class="button" href="/blog/">Back to the notebook →</a></div></div> </main> <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span><a href="/blog/rss.xml">RSS ↗</a><span class="footer-dot">·</span> Built with Astro · Markdown · GitHub Pages</span></div></footer> <script>
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><link rel="icon" href="/blog/favicon.svg"><meta name="description" content="This note does not exist yet."><link rel="canonical" href="https://tsdocode.github.io/blog/404/"><meta property="og:type" content="website"><meta property="og:site_name" content="tsdocode"><meta property="og:title" content="404"><meta property="og:description" content="This note does not exist yet."><meta property="og:url" content="https://tsdocode.github.io/blog/404/"><meta property="og:image" content="https://tsdocode.github.io/blog/og-card.svg"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="404"><meta name="twitter:description" content="This note does not exist yet."><meta name="twitter:image" content="https://tsdocode.github.io/blog/og-card.svg"><title>404 · tsdocode</title><link rel="stylesheet" href="/blog/_astro/BaseLayout.C45Ygo1w.css"></head> <body> <header class="site-header"> <div class="shell nav"> <a class="brand" href="/blog/"><span class="brand-mark mono">&lt;/&gt;</span> tsdocode</a> <nav class="nav-links" aria-label="Main navigation"> <a class href="/blog/">Blog</a> </nav> <div class="nav-actions"><a class="nav-mark" href="https://github.com/tsdocode" aria-label="GitHub">GH</a><a class="nav-mark nav-x" href="https://x.com/tsdocode" aria-label="X">X</a><a class="rss-mark" href="/blog/rss.xml">RSS <span>↗</span></a><button class="icon-button" aria-label="Toggle theme" id="theme-toggle"><span class="theme-mark"></span></button><span class="mobile-menu" aria-hidden="true">MENU</span></div> </div> </header> <main> <div class="shell not-found"><div class="not-found-code mono">404</div><div><span class="post-kicker">A quiet dead end</span><h1>This note does not exist yet.</h1><p>The page you’re looking for may have moved, or it has not been written.</p><a class="button" href="/blog/">Back to the notebook →</a></div></div> </main> <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span><a href="/blog/rss.xml">RSS ↗</a></span></div></footer> <script>
       const toggle = document.querySelector('#theme-toggle');
       const savedTheme = localStorage.getItem('tsdocode-theme');
       if (savedTheme === 'dim') document.documentElement.classList.add('dim');
@@ -6,5 +6,25 @@
         const isDim = document.documentElement.classList.toggle('dim');
         localStorage.setItem('tsdocode-theme', isDim ? 'dim' : 'light');
         document.dispatchEvent(new CustomEvent('tsdocode:theme-change'));
+      });
+
+      document.querySelectorAll('pre.astro-code').forEach((block) => {
+        const code = block.querySelector('code');
+        if (!code || block.querySelector('.copy-code')) return;
+        const copyButton = document.createElement('button');
+        copyButton.className = 'copy-code';
+        copyButton.type = 'button';
+        copyButton.textContent = 'Copy';
+        copyButton.setAttribute('aria-label', 'Copy code to clipboard');
+        copyButton.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(code.textContent ?? '');
+          copyButton.textContent = 'Copied';
+          copyButton.classList.add('is-copied');
+          window.setTimeout(() => {
+            copyButton.textContent = 'Copy';
+            copyButton.classList.remove('is-copied');
+          }, 1600);
+        });
+        block.append(copyButton);
       });
     </script> </body> </html>

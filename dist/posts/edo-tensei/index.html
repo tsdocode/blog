@@ -1,0 +1,529 @@
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><link rel="icon" href="/blog/favicon.svg"><meta name="description" content="How I learned Rust, Linux, CRIU, and CUDA checkpointing while building a runtime for AI workloads."><link rel="canonical" href="https://tsdocode.github.io/blog/posts/edo-tensei/"><meta property="og:type" content="website"><meta property="og:site_name" content="tsdocode"><meta property="og:title" content="I made a warmed AI server disappear — and restore it ready to serve"><meta property="og:description" content="How I learned Rust, Linux, CRIU, and CUDA checkpointing while building a runtime for AI workloads."><meta property="og:url" content="https://tsdocode.github.io/blog/posts/edo-tensei/"><meta property="og:image" content="https://tsdocode.github.io/blog/og-card.svg"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="I made a warmed AI server disappear — and restore it ready to serve"><meta name="twitter:description" content="How I learned Rust, Linux, CRIU, and CUDA checkpointing while building a runtime for AI workloads."><meta name="twitter:image" content="https://tsdocode.github.io/blog/og-card.svg"><title>I made a warmed AI server disappear — and restore it ready to serve · tsdocode</title><link rel="stylesheet" href="/blog/_astro/BaseLayout.C45Ygo1w.css"></head> <body> <header class="site-header"> <div class="shell nav"> <a class="brand" href="/blog/"><span class="brand-mark mono">&lt;/&gt;</span> tsdocode</a> <nav class="nav-links" aria-label="Main navigation"> <a class href="/blog/">Blog</a> </nav> <div class="nav-actions"><a class="nav-mark" href="https://github.com/tsdocode" aria-label="GitHub">GH</a><a class="nav-mark nav-x" href="https://x.com/tsdocode" aria-label="X">X</a><a class="rss-mark" href="/blog/rss.xml">RSS <span>↗</span></a><button class="icon-button" aria-label="Toggle theme" id="theme-toggle"><span class="theme-mark"></span></button><span class="mobile-menu" aria-hidden="true">MENU</span></div> </div> </header> <main> <div class="shell layout"> <article> <div class="breadcrumbs"><a href="/blog/">Blog</a> <span>›</span> AI, inference, systems</div> <header class="article-header"> <h1>I made a warmed AI server disappear — and restore it ready to serve</h1> <p class="dek">How I learned Rust, Linux, CRIU, and CUDA checkpointing while building a runtime for AI workloads.</p> <div class="author"><img class="avatar" src="https://github.com/tsdocode.png?size=96" alt="tsdocode"><div><strong>tsdocode</strong><div class="meta">Aug 30, 2026 <span>·</span> 12 min read</div></div></div> <div class="tags"><span class="tag">ai</span><span class="tag">inference</span><span class="tag">systems</span><span class="tag">linux</span><span class="tag">rust</span><span class="tag">criu</span><span class="tag">cuda</span><span class="tag">vllm</span></div> </header> <div class="article-body"><h1 id="i-made-a-warmed-ai-server-disappear--and-restore-it-ready-to-serve">I made a warmed AI server disappear — and restore it ready to serve</h1>
+<p>Modern AI servers can take minutes to become ready.</p>
+<p>They may need to load model weights, initialize CUDA, compile kernels, capture
+CUDA Graphs, allocate KV cache, and warm up the inference engine before serving
+the first request.</p>
+<p>What if we could pay that initialization cost once, snapshot the running
+workload, and restore it later instead of starting from scratch?</p>
+<p>I explored that question by learning Rust, Linux process internals, CRIU, CUDA
+checkpointing, and vLLM runtime behavior.</p>
+<p>The result is an experimental checkpoint and restore runtime for AI workloads.</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart LR
+  A[&quot;Cold start&quot;] --> B[&quot;Load model&quot;]
+  B --> C[&quot;Compile and warm up&quot;]
+  C --> D[&quot;Ready to serve&quot;]
+  D --> E[&quot;Checkpoint&quot;]
+  E --> F[(&quot;Snapshot&quot;)]
+  F --> G[&quot;Restore&quot;]
+  G --> H[&quot;Ready to serve&quot;]
+" role="img" aria-label="Cold start versus restore">flowchart LR
+  A[&quot;Cold start&quot;] --&gt; B[&quot;Load model&quot;]
+  B --&gt; C[&quot;Compile and warm up&quot;]
+  C --&gt; D[&quot;Ready to serve&quot;]
+  D --&gt; E[&quot;Checkpoint&quot;]
+  E --&gt; F[(&quot;Snapshot&quot;)]
+  F --&gt; G[&quot;Restore&quot;]
+  G --&gt; H[&quot;Ready to serve&quot;]
+</div> </figure> <script type="module" src="/blog/_astro/Mermaid.astro_astro_type_script_index_0_lang.PwqbdlJC.js"></script>
+<p>The latest Gemma 3 27B QAT experiment measured:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Path</th><th style="text-align:right">Total time to ready</th></tr></thead><tbody><tr><td>Cold vLLM startup</td><td style="text-align:right">104.158s</td></tr><tr><td>Restore</td><td style="text-align:right">11.060s</td></tr></tbody></table>
+<p>The restored server returned valid inference output without reloading the
+model or recapturing CUDA Graphs.</p>
+<h2 id="the-problem">The problem</h2>
+<p>Starting an AI server involves much more than loading model weights.</p>
+<p>Depending on the stack, startup may include:</p>
+<ul>
+<li>initializing the API and inference runtime;</li>
+<li>loading model weights into CPU and GPU memory;</li>
+<li>initializing CUDA;</li>
+<li>compiling kernels with <code>torch.compile</code>;</li>
+<li>autotuning GPU kernels;</li>
+<li>warming up representative inputs;</li>
+<li>capturing CUDA Graphs;</li>
+<li>allocating KV cache and runtime buffers;</li>
+<li>starting worker processes.</li>
+</ul>
+<p>All of this work improves steady-state inference performance. But it also
+creates a long period where the GPU is preparing the workload instead of
+serving requests.</p>
+<p>This matters in production when traffic is bursty, GPUs scale to zero, nodes
+fail, or spot instances are reclaimed. Keeping a GPU warm gives low latency,
+but means paying for an idle resource. Cold-starting a replacement means
+repeating the entire initialization process.</p>
+<p>The useful question is not simply whether startup is slow. It is whether
+startup time is large compared with the workload’s useful serving lifetime and
+latency budget.</p>
+<h2 id="the-idea">The idea</h2>
+<p>That led me to a simple question:</p>
+<blockquote>
+<p>Can we snapshot an entire running AI workload, save it to disk, and restore it
+later without paying the startup cost again?</p>
+</blockquote>
+<p>Imagine starting the server once, loading the model, initializing CUDA,
+compiling the runtime, capturing CUDA Graphs, allocating memory, and warming up
+until it is ready to serve.</p>
+<p>Then freeze it.</p>
+<p>Later, instead of repeating the entire startup process, restore the frozen
+state and continue from there.</p>
+<p>If this works, most of the expensive initialization cost is paid only once.</p>
+<h2 id="what-is-inside-a-running-ai-workload">What is inside a running AI workload?</h2>
+<p>Most AI engineers first think about application-level state:</p>
+<ul>
+<li>loaded model configuration;</li>
+<li>model parameters and metadata;</li>
+<li>tokenizer state;</li>
+<li>preprocessing and postprocessing logic;</li>
+<li>API server state;</li>
+<li>scheduler state;</li>
+<li>runtime caches and buffers.</li>
+</ul>
+<p>But modern inference servers are usually not a single process. vLLM and SGLang
+commonly separate the API process from the inference engine, and the engine may
+create additional workers.</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[&quot;API process&quot;] --> B[&quot;Engine process&quot;]
+  B --> C[&quot;GPU worker(s)&quot;]
+  C --> D[&quot;CUDA runtime&quot;]
+" role="img" aria-label="AI workload process structure">flowchart TB
+  A[&quot;API process&quot;] --&gt; B[&quot;Engine process&quot;]
+  B --&gt; C[&quot;GPU worker(s)&quot;]
+  C --&gt; D[&quot;CUDA runtime&quot;]
+</div> </figure> 
+<p>These processes communicate through sockets, pipes, shared memory, and file
+descriptors. Restoring only the API process would not be enough. The API could
+come back while the engine was missing.</p>
+<p>For checkpointing, I divided the workload into two lower-level parts:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Layer</th><th>State included</th></tr></thead><tbody><tr><td>CPU and OS</td><td>Process memory, threads, sockets, namespaces, and kernel resources</td></tr><tr><td>GPU and CUDA</td><td>CUDA contexts, GPU memory, streams, events, kernels, and CUDA Graphs</td></tr></tbody></table>
+<p>Application state is implemented through these CPU and GPU layers.</p>
+<h2 id="snapshot-the-cpu-process-with-criu">Snapshot the CPU process with CRIU</h2>
+<p>After understanding the application state, I started with the simplest
+possible workload: a CPU-only process.</p>
+<p>Before dealing with CUDA and GPU memory, I needed to answer a smaller question:</p>
+<blockquote>
+<p>Can I snapshot a running Linux process and bring it back with the same state?</p>
+</blockquote>
+<p>Fortunately, I found CRIU — an open-source Linux project for checkpointing and
+restoring running processes.</p>
+<p>The workflow was:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[Start process] --> B[Create state]
+  B --> C[CRIU dump]
+  C --> D[Remove original process]
+  D --> E[CRIU restore]
+  E --> F[Verify state]
+" role="img" aria-label="CPU checkpoint workflow">flowchart TB
+  A[Start process] --&gt; B[Create state]
+  B --&gt; C[CRIU dump]
+  C --&gt; D[Remove original process]
+  D --&gt; E[CRIU restore]
+  E --&gt; F[Verify state]
+</div> </figure> 
+<p>The first program maintained a counter in memory and responded to signals:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="python"><code><span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">counter </span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">=</span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF"> 0</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">def</span><span style="--shiki-light:#8250DF;--shiki-dark:#D2A8FF"> handle_request</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">(_signal, _frame):</span></span>
+<span class="line"><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">    global</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3"> counter</span></span>
+<span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">    counter </span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">+=</span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF"> 1</span></span>
+<span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">    write_event(</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;request&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">, counter)</span></span></code></pre>
+<p>I checkpointed it with:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">sudo</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> criu</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> dump</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    -t</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> &quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">$PID</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --images-dir</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /tmp/cpu-checkpoint</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --shell-job</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --leave-running</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --link-remap</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --tcp-established</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --manage-cgroups=ignore</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --log-file</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /tmp/cpu-checkpoint/dump.log</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --verbosity=4</span></span></code></pre>
+<p>Then I removed the original process:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">sudo</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> kill</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> &quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">$PID</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;</span></span></code></pre>
+<p>And restored it:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">sudo</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> criu</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> restore</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --images-dir</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /tmp/cpu-checkpoint</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --restore-detached</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --shell-job</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --manage-cgroups=ignore</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --root</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --tcp-established</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --pidfile</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /tmp/cpu-checkpoint/restored.pid</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --log-file</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> /tmp/cpu-checkpoint/restore.log</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --verbosity=4</span></span></code></pre>
+<p>The event file showed that the counter continued after restore:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="json"><code><span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">{</span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;event&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;warmup&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">, </span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;counter&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">0</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">}</span></span>
+<span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">{</span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;event&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;request&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">, </span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;counter&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">1</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">}</span></span>
+<span class="line"><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">{</span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;event&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF">&quot;request&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">, </span><span style="--shiki-light:#116329;--shiki-dark:#7EE787">&quot;counter&quot;</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">: </span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">2</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">}</span></span></code></pre>
+<p>The process did not restart from the beginning. It continued from the memory
+state captured during the checkpoint.</p>
+<h2 id="what-criu-actually-saves">What CRIU actually saves</h2>
+<p>CRIU creates multiple image files instead of one snapshot file:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="text"><code><span class="line"><span>cpu-checkpoint/</span></span>
+<span class="line"><span>├── core-*.img</span></span>
+<span class="line"><span>├── pages-*.img</span></span>
+<span class="line"><span>├── mm-*.img</span></span>
+<span class="line"><span>├── files-*.img</span></span>
+<span class="line"><span>├── fs-*.img</span></span>
+<span class="line"><span>├── ids-*.img</span></span>
+<span class="line"><span>├── inventory.img</span></span>
+<span class="line"><span>└── dump.log</span></span></code></pre>
+<p>These images may contain process memory, CPU registers, thread state, file
+descriptors, signals, process identifiers, filesystem context, and namespace
+information.</p>
+<p>The important realization was:</p>
+<blockquote>
+<p>A process checkpoint is not just a copy of application data. It is a saved
+execution context.</p>
+</blockquote>
+<h2 id="checkpointing-the-gpu-with-cuda">Checkpointing the GPU with CUDA</h2>
+<p>The idea for this part was inspired by
+<a href="https://modal.com/blog/gpu-mem-snapshots">Modal’s work on GPU memory snapshots</a>.</p>
+<p>Their work highlights an important idea: restoring a prepared GPU runtime can
+be much faster than loading the model and rebuilding the execution environment
+from scratch.</p>
+<p>That made me ask a lower-level question:</p>
+<blockquote>
+<p>Can CUDA checkpointing be coordinated with Linux process checkpointing so an
+entire AI workload can continue after restore?</p>
+</blockquote>
+<p>A running CUDA process may contain:</p>
+<ul>
+<li>a CUDA context;</li>
+<li>GPU memory allocations;</li>
+<li>CUDA streams;</li>
+<li>CUDA events;</li>
+<li>compiled kernels;</li>
+<li>CUDA Graphs;</li>
+<li>allocator state.</li>
+</ul>
+<p>CRIU understands Linux process state, but it does not automatically understand
+all of the state managed by the NVIDIA driver and CUDA runtime.</p>
+<p>The CUDA lifecycle became:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="stateDiagram-v2
+  [*] --> RUNNING
+  RUNNING --> LOCKED: lock
+  LOCKED --> CHECKPOINTED: checkpoint GPU state
+  CHECKPOINTED --> SNAPSHOT: CRIU dump
+  SNAPSHOT --> RESTORED: CRIU restore
+  RESTORED --> RUNNING: restore CUDA and unlock
+" role="img" aria-label="CUDA checkpoint lifecycle">stateDiagram-v2
+  [*] --&gt; RUNNING
+  RUNNING --&gt; LOCKED: lock
+  LOCKED --&gt; CHECKPOINTED: checkpoint GPU state
+  CHECKPOINTED --&gt; SNAPSHOT: CRIU dump
+  SNAPSHOT --&gt; RESTORED: CRIU restore
+  RESTORED --&gt; RUNNING: restore CUDA and unlock
+</div> </figure> 
+<p>The order matters. GPU state must be checkpointed before the CPU process is
+dumped. During restore, the CPU process must come back before CUDA state can be
+restored to it.</p>
+<h2 id="connecting-cpu-and-gpu-state">Connecting CPU and GPU state</h2>
+<p>The complete orchestration looks like this:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[&quot;Running AI workload&quot;] --> B[&quot;Lock CUDA process&quot;]
+  B --> C[&quot;Checkpoint GPU state&quot;]
+  C --> D[&quot;CRIU dump CPU and OS state&quot;]
+  D --> E[(&quot;Persist snapshot&quot;)]
+  E --> F[&quot;CRIU restore process&quot;]
+  F --> G[&quot;Restore CUDA state&quot;]
+  G --> H[&quot;Unlock CUDA process&quot;]
+  H --> I[&quot;Verify inference&quot;]
+" role="img" aria-label="CPU and GPU checkpoint coordination">flowchart TB
+  A[&quot;Running AI workload&quot;] --&gt; B[&quot;Lock CUDA process&quot;]
+  B --&gt; C[&quot;Checkpoint GPU state&quot;]
+  C --&gt; D[&quot;CRIU dump CPU and OS state&quot;]
+  D --&gt; E[(&quot;Persist snapshot&quot;)]
+  E --&gt; F[&quot;CRIU restore process&quot;]
+  F --&gt; G[&quot;Restore CUDA state&quot;]
+  G --&gt; H[&quot;Unlock CUDA process&quot;]
+  H --&gt; I[&quot;Verify inference&quot;]
+</div> </figure> 
+<p>The difficult question was how the restored GPU state reconnects to the
+restored Linux process. The answer depends on preserving process identity and
+restoring both layers in the correct order.</p>
+<h2 id="the-happy-path-worked-vllm-did-not">The happy path worked. vLLM did not.</h2>
+<p>A small CUDA fixture could checkpoint and restore successfully. A real vLLM
+server was more complicated.</p>
+<p>The server included:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[API server] --> B[EngineCore]
+  B --> C[Worker processes]
+  C --> D[CUDA runtime]
+" role="img" aria-label="vLLM process hierarchy">flowchart TB
+  A[API server] --&gt; B[EngineCore]
+  B --&gt; C[Worker processes]
+  C --&gt; D[CUDA runtime]
+</div> </figure> 
+<p>Restoring only the API process was not enough. I had to snapshot the process
+group together, including the API parent, engine process, CUDA-owning workers,
+IPC relationships, sockets, and shared memory.</p>
+<p>The restore test was considered successful only when:</p>
+<ol>
+<li>the original process group disappeared;</li>
+<li>the API process was restored;</li>
+<li>the engine process was restored;</li>
+<li>CUDA state was restored;</li>
+<li>the health endpoint responded;</li>
+<li>a real inference request returned <code>Ready.</code>.</li>
+</ol>
+<h2 id="the-io_uring-problem">The io_uring problem</h2>
+<p>The most surprising failure appeared when asynchronous scheduling was enabled.
+CRIU failed with an error referring to:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="text"><code><span class="line"><span>anon_inode:[io_uring]</span></span></code></pre>
+<p>The problem was not the model or the HTTP API. vLLM’s asynchronous scheduler
+used <code>io_uring</code>, a Linux kernel interface for asynchronous I/O. Stock CRIU did
+not restore the required io_uring state for this workflow.</p>
+<p>The debugging path looked like this:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[Async vLLM] --> B[CRIU failure]
+  B --> C[Inspect process resources]
+  C --> D[Identify io_uring]
+  D --> E[Patch CRIU]
+  E --> F[Rebuild CRIU]
+  F --> G[Retry restore]
+" role="img" aria-label="io_uring debugging path">flowchart TB
+  A[Async vLLM] --&gt; B[CRIU failure]
+  B --&gt; C[Inspect process resources]
+  C --&gt; D[Identify io_uring]
+  D --&gt; E[Patch CRIU]
+  E --&gt; F[Rebuild CRIU]
+  F --&gt; G[Retry restore]
+</div> </figure> 
+<p>This resulted in an experimental CRIU fork with io_uring support.</p>
+<p>The important lesson was:</p>
+<blockquote>
+<p>Framework compatibility can depend on kernel objects that are invisible at
+the Python level.</p>
+</blockquote>
+<h2 id="releasing-the-kv-cache">Releasing the KV cache</h2>
+<p>The full process snapshot can become very large because it may contain model
+weights, allocator state, compiled runtime state, CUDA Graph pools, and KV-cache
+pages.</p>
+<p>The KV cache is request-specific. It represents active sequences and previous
+tokens, not just the model itself.</p>
+<p>For the large model experiment, I used a release-and-recreate workflow:</p>
+<figure class="mermaid-frame"> <div class="mermaid" data-chart="flowchart TB
+  A[Before snapshot: weights + compiled state + CUDA Graphs + KV cache] --> B[Snapshot: weights + compiled state + CUDA Graphs]
+  B --> C[Restore weights]
+  C --> D[Create fresh KV cache]
+  D --> E[Run warm inference]
+  E --> F[Ready to serve]
+" role="img" aria-label="Release and recreate the KV cache">flowchart TB
+  A[Before snapshot: weights + compiled state + CUDA Graphs + KV cache] --&gt; B[Snapshot: weights + compiled state + CUDA Graphs]
+  B --&gt; C[Restore weights]
+  C --&gt; D[Create fresh KV cache]
+  D --&gt; E[Run warm inference]
+  E --&gt; F[Ready to serve]
+</div> </figure> 
+<p>This makes the snapshot smaller, but active requests and previous conversation
+KV state are not preserved.</p>
+<h2 id="did-it-actually-make-startup-faster">Did it actually make startup faster?</h2>
+<p>The final test used:</p>
+<ul>
+<li>Ubuntu 24.04 x86_64;</li>
+<li>NVIDIA H100 80 GB;</li>
+<li>CUDA 12.8;</li>
+<li>CRIU 4.2.1;</li>
+<li>Gemma 3 27B QAT;</li>
+<li>vLLM with Triton attention;</li>
+<li>asynchronous scheduling;</li>
+<li>one GPU;</li>
+<li>same-host restore;</li>
+<li>fresh KV-cache recreation.</li>
+</ul>
+<p>Readiness meant more than “the process exists.” The health endpoint had to
+respond, a warm inference request had to complete, and the output had to be
+valid.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Metric</th><th style="text-align:right">Cold boot</th><th style="text-align:right">Restore</th></tr></thead><tbody><tr><td><code>/health</code> ready</td><td style="text-align:right">104.066s</td><td style="text-align:right">11.007s</td></tr><tr><td>Total time to ready</td><td style="text-align:right">104.158s</td><td style="text-align:right">11.060s</td></tr><tr><td>TTFT</td><td style="text-align:right">0.025s</td><td style="text-align:right">0.034s</td></tr><tr><td>Model reload</td><td style="text-align:right">Yes</td><td style="text-align:right">No</td></tr><tr><td>CUDA Graph recapture</td><td style="text-align:right">Yes</td><td style="text-align:right">No</td></tr><tr><td>Valid output</td><td style="text-align:right"><code>Ready.</code></td><td style="text-align:right"><code>Ready.</code></td></tr></tbody></table>
+<p>The time-to-ready improvement was approximately:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="text"><code><span class="line"><span>104.158 / 11.060 = 9.4×</span></span></code></pre>
+<p>These are measurements from one development environment, not universal
+guarantees.</p>
+<h2 id="what-this-does--and-does-not--solve">What this does — and does not — solve</h2>
+<p>It can avoid repeating model loading, Python runtime initialization,
+<code>torch.compile</code>, CUDA Graph capture, and some kernel warm-up.</p>
+<p>It does not automatically solve:</p>
+<ul>
+<li>snapshot storage size;</li>
+<li>snapshot transfer time;</li>
+<li>driver compatibility;</li>
+<li>GPU compatibility;</li>
+<li>network recovery;</li>
+<li>external service dependencies;</li>
+<li>in-flight request preservation;</li>
+<li>distributed multi-GPU state.</li>
+</ul>
+<p>The validated scope is Linux x86_64, one compatible NVIDIA GPU, same-host
+restore, controlled process groups, experimental vLLM support, and experimental
+Kubernetes support.</p>
+<h2 id="what-i-learned">What I learned</h2>
+<p>The project started as an AI infrastructure problem, but became a systems
+programming project.</p>
+<p>I learned that:</p>
+<ol>
+<li>model weights are only one part of inference state;</li>
+<li>a serving server is a process tree, not a single process;</li>
+<li>CPU checkpointing and GPU checkpointing are separate problems;</li>
+<li>Linux processes own resources invisible at the Python level;</li>
+<li>FFI requires precise ABI and memory-layout discipline;</li>
+<li>restore ordering matters;</li>
+<li>cleanup and rollback are part of correctness;</li>
+<li>a successful restore must be verified with real inference;</li>
+<li>time-to-ready is more meaningful than process restore time alone;</li>
+<li>experimental compatibility must be stated precisely.</li>
+</ol>
+<h2 id="what-is-next">What is next?</h2>
+<p>The next directions are:</p>
+<ul>
+<li>upstream CRIU support for io_uring;</li>
+<li>multi-GPU process-group restore;</li>
+<li>broader vLLM configurations;</li>
+<li>SGLang validation;</li>
+<li>Triton server restore;</li>
+<li>persistent snapshot storage;</li>
+<li>snapshot deduplication;</li>
+<li>controller-managed Kubernetes restore;</li>
+<li>cross-node GPU compatibility;</li>
+<li>easier binary installation.</li>
+</ul>
+<h2 id="try-it">Try it</h2>
+<p>Start with the CPU demonstration:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">git</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> clone</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> https://github.com/tsdocode/edo-tensei.git</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">cd</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> edo-tensei</span></span>
+<span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">cargo</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> run</span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF"> --example</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> resume</span></span></code></pre>
+<p>Inspect host capabilities:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">cargo</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> run</span><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF"> --</span><span style="--shiki-light:#0A3069;--shiki-dark:#A5D6FF"> doctor</span></span></code></pre>
+<p>For the vLLM integration:</p>
+<pre class="astro-code astro-code-themes github-light-default github-dark-default" style="--shiki-light:#1f2328;--shiki-dark:#e6edf3;--shiki-light-bg:#ffffff;--shiki-dark-bg:#0d1117;overflow-x:auto" tabindex="0" data-language="bash"><code><span class="line"><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">export</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3"> EDO_CRIU</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">=</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">/path/to/edo-criu</span></span>
+<span class="line"><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">export</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3"> EDO_BIN</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72">=</span><span style="--shiki-light:#1F2328;--shiki-dark:#E6EDF3">target/debug/edo</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#953800;--shiki-dark:#FFA657">./examples/07_vllm_gemma31b_qat/run.sh</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --release-kv-cache</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --fast-restore</span><span style="--shiki-light:#CF222E;--shiki-dark:#FF7B72"> \</span></span>
+<span class="line"><span style="--shiki-light:#0550AE;--shiki-dark:#79C0FF">    --io-uring-restore</span></span></code></pre>
+<p>The vLLM workflow requires a compatible Linux host, NVIDIA GPU, CUDA
+installation, vLLM environment, and the experimental CRIU fork with io_uring
+support.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>I started with a simple question:</p>
+<blockquote>
+<p>Why does starting an AI server take so long?</p>
+</blockquote>
+<p>The answer led me through Rust, Linux processes, <code>/proc</code>, CRIU, CUDA
+checkpointing, FFI, io_uring, vLLM worker processes, CUDA Graphs, KV cache, and
+Kubernetes namespaces.</p>
+<p>The result is not a production-ready platform. It is an experimental
+demonstration that a warmed AI workload can be checkpointed and restored with
+much of its runtime state intact.</p>
+<p>The most important lesson is:</p>
+<blockquote>
+<p>Restoring an AI server is not the same as loading a model again. It means
+restoring the complete CPU and GPU runtime that makes the model ready to
+serve.</p>
+</blockquote>
+<p>For the validated Gemma experiment, that reduced time-to-ready from 104.158
+seconds to 11.060 seconds.</p>
+<p>The project began as an attempt to reduce startup time. It became a journey
+into understanding what a running AI workload really is.</p></div> </article> <aside class="toc article-toc"><span class="toc-kicker">On this page</span><h2>Table of contents</h2><ol><li><a href="#the-problem"><span>01</span>The problem</a></li><li><a href="#the-idea"><span>02</span>The idea</a></li><li><a href="#what-is-inside-a-running-ai-workload"><span>03</span>What is inside a running AI workload?</a></li><li><a href="#snapshot-the-cpu-process-with-criu"><span>04</span>Snapshot the CPU process with CRIU</a></li><li><a href="#what-criu-actually-saves"><span>05</span>What CRIU actually saves</a></li><li><a href="#checkpointing-the-gpu-with-cuda"><span>06</span>Checkpointing the GPU with CUDA</a></li><li><a href="#connecting-cpu-and-gpu-state"><span>07</span>Connecting CPU and GPU state</a></li><li><a href="#the-happy-path-worked-vllm-did-not"><span>08</span>The happy path worked. vLLM did not.</a></li><li><a href="#the-io_uring-problem"><span>09</span>The io_uring problem</a></li><li><a href="#releasing-the-kv-cache"><span>10</span>Releasing the KV cache</a></li><li><a href="#did-it-actually-make-startup-faster"><span>11</span>Did it actually make startup faster?</a></li><li><a href="#what-this-does-and-does-not-solve"><span>12</span>What this does — and does not — solve</a></li><li><a href="#what-i-learned"><span>13</span>What I learned</a></li><li><a href="#what-is-next"><span>14</span>What is next?</a></li><li><a href="#try-it"><span>15</span>Try it</a></li><li><a href="#conclusion"><span>16</span>Conclusion</a></li></ol></aside> </div> </main> <footer class="site-footer"><div class="shell footer-row"><span>© 2026 tsdocode</span><span><a href="/blog/rss.xml">RSS ↗</a></span></div></footer> <script>
+      const toggle = document.querySelector('#theme-toggle');
+      const savedTheme = localStorage.getItem('tsdocode-theme');
+      if (savedTheme === 'dim') document.documentElement.classList.add('dim');
+      toggle?.addEventListener('click', () => {
+        const isDim = document.documentElement.classList.toggle('dim');
+        localStorage.setItem('tsdocode-theme', isDim ? 'dim' : 'light');
+        document.dispatchEvent(new CustomEvent('tsdocode:theme-change'));
+      });
+
+      document.querySelectorAll('pre.astro-code').forEach((block) => {
+        const code = block.querySelector('code');
+        if (!code || block.querySelector('.copy-code')) return;
+        const copyButton = document.createElement('button');
+        copyButton.className = 'copy-code';
+        copyButton.type = 'button';
+        copyButton.textContent = 'Copy';
+        copyButton.setAttribute('aria-label', 'Copy code to clipboard');
+        copyButton.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(code.textContent ?? '');
+          copyButton.textContent = 'Copied';
+          copyButton.classList.add('is-copied');
+          window.setTimeout(() => {
+            copyButton.textContent = 'Copy';
+            copyButton.classList.remove('is-copied');
+          }, 1600);
+        });
+        block.append(copyButton);
+      });
+    </script> </body> </html>

@@ -28,6 +28,17 @@ Astro 6 blog with Markdown/MDX posts, a GitHub Pages deployment workflow, and th
 
 Posts with `draft: true` are excluded from the site and RSS feed.
 
+### Markdown tables
+
+Tables are styled automatically inside post content:
+
+```md
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Startup time | 10 min | 30 sec |
+| GPU memory | 24 GB | 24 GB |
+```
+
 ## Local development
 
 ```bash

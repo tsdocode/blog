@@ -1,0 +1,546 @@
+---
+title: "Edo Tensei: Checkpoint and Restore Live AI Workloads"
+description: "How I built a system that freezes running AI workloads—from Python processes to CUDA and vLLM—and brings them back ready to serve."
+category: AI, inference, systems
+date: 2026-08-30
+readTime: 12 min read
+tags: [ai, inference, systems, linux, rust, criu, cuda, vllm]
+draft: false
+---
+
+import Mermaid from '../../components/Mermaid.astro';
+
+# I made a warmed AI server disappear — and restore it ready to serve
+
+Modern AI servers can take minutes to become ready.
+
+They may need to load model weights, initialize CUDA, compile kernels, capture
+CUDA Graphs, allocate KV cache, and warm up the inference engine before serving
+the first request.
+
+What if we could pay that initialization cost once, snapshot the running
+workload, and restore it later instead of starting from scratch?
+
+I explored that question by learning Rust, Linux process internals, CRIU, CUDA
+checkpointing, and vLLM runtime behavior.
+
+The result is an experimental checkpoint and restore runtime for AI workloads.
+
+<Mermaid
+title="Cold start versus restore"
+chart={`flowchart LR
+    A["Cold start"] --> B["Load model"]
+    B --> C["Compile and warm up"]
+    C --> D["Ready to serve"]
+    D --> E["Checkpoint"]
+    E --> F[("Snapshot")]
+    F --> G["Restore"]
+    G --> H["Ready to serve"]
+`}
+/>
+
+The latest Gemma 3 27B QAT experiment measured:
+
+| Path | Total time to ready |
+| --- | ---: |
+| Cold vLLM startup | 104.158s |
+| Restore | 11.060s |
+
+The restored server returned valid inference output without reloading the
+model or recapturing CUDA Graphs.
+
+## The problem
+
+Starting an AI server involves much more than loading model weights.
+
+Depending on the stack, startup may include:
+
+- initializing the API and inference runtime;
+- loading model weights into CPU and GPU memory;
+- initializing CUDA;
+- compiling kernels with `torch.compile`;
+- autotuning GPU kernels;
+- warming up representative inputs;
+- capturing CUDA Graphs;
+- allocating KV cache and runtime buffers;
+- starting worker processes.
+
+All of this work improves steady-state inference performance. But it also
+creates a long period where the GPU is preparing the workload instead of
+serving requests.
+
+This matters in production when traffic is bursty, GPUs scale to zero, nodes
+fail, or spot instances are reclaimed. Keeping a GPU warm gives low latency,
+but means paying for an idle resource. Cold-starting a replacement means
+repeating the entire initialization process.
+
+The useful question is not simply whether startup is slow. It is whether
+startup time is large compared with the workload's useful serving lifetime and
+latency budget.
+
+## The idea
+
+That led me to a simple question:
+
+> Can we snapshot an entire running AI workload, save it to disk, and restore it
+> later without paying the startup cost again?
+
+Imagine starting the server once, loading the model, initializing CUDA,
+compiling the runtime, capturing CUDA Graphs, allocating memory, and warming up
+until it is ready to serve.
+
+Then freeze it.
+
+Later, instead of repeating the entire startup process, restore the frozen
+state and continue from there.
+
+If this works, most of the expensive initialization cost is paid only once.
+
+## What is inside a running AI workload?
+
+Most AI engineers first think about application-level state:
+
+- loaded model configuration;
+- model parameters and metadata;
+- tokenizer state;
+- preprocessing and postprocessing logic;
+- API server state;
+- scheduler state;
+- runtime caches and buffers.
+
+But modern inference servers are usually not a single process. vLLM and SGLang
+commonly separate the API process from the inference engine, and the engine may
+create additional workers.
+
+<Mermaid
+title="AI workload process structure"
+chart={`flowchart TB
+    A["API process"] --> B["Engine process"]
+    B --> C["GPU worker(s)"]
+    C --> D["CUDA runtime"]
+`}
+/>
+
+These processes communicate through sockets, pipes, shared memory, and file
+descriptors. Restoring only the API process would not be enough. The API could
+come back while the engine was missing.
+
+For checkpointing, I divided the workload into two lower-level parts:
+
+| Layer | State included |
+| --- | --- |
+| CPU and OS | Process memory, threads, sockets, namespaces, and kernel resources |
+| GPU and CUDA | CUDA contexts, GPU memory, streams, events, kernels, and CUDA Graphs |
+
+Application state is implemented through these CPU and GPU layers.
+
+## Snapshot the CPU process with CRIU
+
+After understanding the application state, I started with the simplest
+possible workload: a CPU-only process.
+
+Before dealing with CUDA and GPU memory, I needed to answer a smaller question:
+
+> Can I snapshot a running Linux process and bring it back with the same state?
+
+Fortunately, I found CRIU — an open-source Linux project for checkpointing and
+restoring running processes.
+
+The workflow was:
+
+<Mermaid
+title="CPU checkpoint workflow"
+chart={`flowchart TB
+    A[Start process] --> B[Create state]
+    B --> C[CRIU dump]
+    C --> D[Remove original process]
+    D --> E[CRIU restore]
+    E --> F[Verify state]
+`}
+/>
+
+The first program maintained a counter in memory and responded to signals:
+
+```python
+counter = 0
+
+def handle_request(_signal, _frame):
+    global counter
+    counter += 1
+    write_event("request", counter)
+```
+
+I checkpointed it with:
+
+```bash
+sudo criu dump \
+    -t "$PID" \
+    --images-dir /tmp/cpu-checkpoint \
+    --shell-job \
+    --leave-running \
+    --link-remap \
+    --tcp-established \
+    --manage-cgroups=ignore \
+    --log-file /tmp/cpu-checkpoint/dump.log \
+    --verbosity=4
+```
+
+Then I removed the original process:
+
+```bash
+sudo kill "$PID"
+```
+
+And restored it:
+
+```bash
+sudo criu restore \
+    --images-dir /tmp/cpu-checkpoint \
+    --restore-detached \
+    --shell-job \
+    --manage-cgroups=ignore \
+    --root / \
+    --tcp-established \
+    --pidfile /tmp/cpu-checkpoint/restored.pid \
+    --log-file /tmp/cpu-checkpoint/restore.log \
+    --verbosity=4
+```
+
+The event file showed that the counter continued after restore:
+
+```json
+{"event": "warmup", "counter": 0}
+{"event": "request", "counter": 1}
+{"event": "request", "counter": 2}
+```
+
+The process did not restart from the beginning. It continued from the memory
+state captured during the checkpoint.
+
+## What CRIU actually saves
+
+CRIU creates multiple image files instead of one snapshot file:
+
+```text
+cpu-checkpoint/
+├── core-*.img
+├── pages-*.img
+├── mm-*.img
+├── files-*.img
+├── fs-*.img
+├── ids-*.img
+├── inventory.img
+└── dump.log
+```
+
+These images may contain process memory, CPU registers, thread state, file
+descriptors, signals, process identifiers, filesystem context, and namespace
+information.
+
+The important realization was:
+
+> A process checkpoint is not just a copy of application data. It is a saved
+> execution context.
+
+## Checkpointing the GPU with CUDA
+
+The idea for this part was inspired by
+[Modal's work on GPU memory snapshots](https://modal.com/blog/gpu-mem-snapshots).
+
+Their work highlights an important idea: restoring a prepared GPU runtime can
+be much faster than loading the model and rebuilding the execution environment
+from scratch.
+
+That made me ask a lower-level question:
+
+> Can CUDA checkpointing be coordinated with Linux process checkpointing so an
+> entire AI workload can continue after restore?
+
+A running CUDA process may contain:
+
+- a CUDA context;
+- GPU memory allocations;
+- CUDA streams;
+- CUDA events;
+- compiled kernels;
+- CUDA Graphs;
+- allocator state.
+
+CRIU understands Linux process state, but it does not automatically understand
+all of the state managed by the NVIDIA driver and CUDA runtime.
+
+The CUDA lifecycle became:
+
+<Mermaid
+title="CUDA checkpoint lifecycle"
+chart={`stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> LOCKED: lock
+    LOCKED --> CHECKPOINTED: checkpoint GPU state
+    CHECKPOINTED --> SNAPSHOT: CRIU dump
+    SNAPSHOT --> RESTORED: CRIU restore
+    RESTORED --> RUNNING: restore CUDA and unlock
+`}
+/>
+
+The order matters. GPU state must be checkpointed before the CPU process is
+dumped. During restore, the CPU process must come back before CUDA state can be
+restored to it.
+
+## Connecting CPU and GPU state
+
+The complete orchestration looks like this:
+
+<Mermaid
+title="CPU and GPU checkpoint coordination"
+chart={`flowchart TB
+    A["Running AI workload"] --> B["Lock CUDA process"]
+    B --> C["Checkpoint GPU state"]
+    C --> D["CRIU dump CPU and OS state"]
+    D --> E[("Persist snapshot")]
+    E --> F["CRIU restore process"]
+    F --> G["Restore CUDA state"]
+    G --> H["Unlock CUDA process"]
+    H --> I["Verify inference"]
+`}
+/>
+
+The difficult question was how the restored GPU state reconnects to the
+restored Linux process. The answer depends on preserving process identity and
+restoring both layers in the correct order.
+
+## The happy path worked. vLLM did not.
+
+A small CUDA fixture could checkpoint and restore successfully. A real vLLM
+server was more complicated.
+
+The server included:
+
+<Mermaid
+title="vLLM process hierarchy"
+chart={`flowchart TB
+    A[API server] --> B[EngineCore]
+    B --> C[Worker processes]
+    C --> D[CUDA runtime]
+`}
+/>
+
+Restoring only the API process was not enough. I had to snapshot the process
+group together, including the API parent, engine process, CUDA-owning workers,
+IPC relationships, sockets, and shared memory.
+
+The restore test was considered successful only when:
+
+1. the original process group disappeared;
+2. the API process was restored;
+3. the engine process was restored;
+4. CUDA state was restored;
+5. the health endpoint responded;
+6. a real inference request returned `Ready.`.
+
+## The io_uring problem
+
+The most surprising failure appeared when asynchronous scheduling was enabled.
+CRIU failed with an error referring to:
+
+```text
+anon_inode:[io_uring]
+```
+
+The problem was not the model or the HTTP API. vLLM's asynchronous scheduler
+used `io_uring`, a Linux kernel interface for asynchronous I/O. Stock CRIU did
+not restore the required io_uring state for this workflow.
+
+The debugging path looked like this:
+
+<Mermaid
+title="io_uring debugging path"
+chart={`flowchart TB
+    A[Async vLLM] --> B[CRIU failure]
+    B --> C[Inspect process resources]
+    C --> D[Identify io_uring]
+    D --> E[Patch CRIU]
+    E --> F[Rebuild CRIU]
+    F --> G[Retry restore]
+`}
+/>
+
+This resulted in an experimental CRIU fork with io_uring support.
+
+The important lesson was:
+
+> Framework compatibility can depend on kernel objects that are invisible at
+> the Python level.
+
+## Releasing the KV cache
+
+The full process snapshot can become very large because it may contain model
+weights, allocator state, compiled runtime state, CUDA Graph pools, and KV-cache
+pages.
+
+The KV cache is request-specific. It represents active sequences and previous
+tokens, not just the model itself.
+
+For the large model experiment, I used a release-and-recreate workflow:
+
+<Mermaid
+title="Release and recreate the KV cache"
+chart={`flowchart TB
+    A[Before snapshot: weights + compiled state + CUDA Graphs + KV cache] --> B[Snapshot: weights + compiled state + CUDA Graphs]
+    B --> C[Restore weights]
+    C --> D[Create fresh KV cache]
+    D --> E[Run warm inference]
+    E --> F[Ready to serve]
+`}
+/>
+
+This makes the snapshot smaller, but active requests and previous conversation
+KV state are not preserved.
+
+## Did it actually make startup faster?
+
+The final test used:
+
+- Ubuntu 24.04 x86_64;
+- NVIDIA H100 80 GB;
+- CUDA 12.8;
+- CRIU 4.2.1;
+- Gemma 3 27B QAT;
+- vLLM with Triton attention;
+- asynchronous scheduling;
+- one GPU;
+- same-host restore;
+- fresh KV-cache recreation.
+
+Readiness meant more than “the process exists.” The health endpoint had to
+respond, a warm inference request had to complete, and the output had to be
+valid.
+
+| Metric | Cold boot | Restore |
+| --- | ---: | ---: |
+| `/health` ready | 104.066s | 11.007s |
+| Total time to ready | 104.158s | 11.060s |
+| TTFT | 0.025s | 0.034s |
+| Model reload | Yes | No |
+| CUDA Graph recapture | Yes | No |
+| Valid output | `Ready.` | `Ready.` |
+
+The time-to-ready improvement was approximately:
+
+```text
+104.158 / 11.060 = 9.4×
+```
+
+These are measurements from one development environment, not universal
+guarantees.
+
+## What this does — and does not — solve
+
+It can avoid repeating model loading, Python runtime initialization,
+`torch.compile`, CUDA Graph capture, and some kernel warm-up.
+
+It does not automatically solve:
+
+- snapshot storage size;
+- snapshot transfer time;
+- driver compatibility;
+- GPU compatibility;
+- network recovery;
+- external service dependencies;
+- in-flight request preservation;
+- distributed multi-GPU state.
+
+The validated scope is Linux x86_64, one compatible NVIDIA GPU, same-host
+restore, controlled process groups, experimental vLLM support, and experimental
+Kubernetes support.
+
+## What I learned
+
+The project started as an AI infrastructure problem, but became a systems
+programming project.
+
+I learned that:
+
+1. model weights are only one part of inference state;
+2. a serving server is a process tree, not a single process;
+3. CPU checkpointing and GPU checkpointing are separate problems;
+4. Linux processes own resources invisible at the Python level;
+5. FFI requires precise ABI and memory-layout discipline;
+6. restore ordering matters;
+7. cleanup and rollback are part of correctness;
+8. a successful restore must be verified with real inference;
+9. time-to-ready is more meaningful than process restore time alone;
+10. experimental compatibility must be stated precisely.
+
+## What is next?
+
+The next directions are:
+
+- upstream CRIU support for io_uring;
+- multi-GPU process-group restore;
+- broader vLLM configurations;
+- SGLang validation;
+- Triton server restore;
+- persistent snapshot storage;
+- snapshot deduplication;
+- controller-managed Kubernetes restore;
+- cross-node GPU compatibility;
+- easier binary installation.
+
+## Try it
+
+Start with the CPU demonstration:
+
+```bash
+git clone https://github.com/tsdocode/edo-tensei.git
+cd edo-tensei
+cargo run --example resume
+```
+
+Inspect host capabilities:
+
+```bash
+cargo run -- doctor
+```
+
+For the vLLM integration:
+
+```bash
+export EDO_CRIU=/path/to/edo-criu
+export EDO_BIN=target/debug/edo
+
+./examples/07_vllm_gemma31b_qat/run.sh \
+    --release-kv-cache \
+    --fast-restore \
+    --io-uring-restore
+```
+
+The vLLM workflow requires a compatible Linux host, NVIDIA GPU, CUDA
+installation, vLLM environment, and the experimental CRIU fork with io_uring
+support.
+
+## Conclusion
+
+I started with a simple question:
+
+> Why does starting an AI server take so long?
+
+The answer led me through Rust, Linux processes, `/proc`, CRIU, CUDA
+checkpointing, FFI, io_uring, vLLM worker processes, CUDA Graphs, KV cache, and
+Kubernetes namespaces.
+
+The result is not a production-ready platform. It is an experimental
+demonstration that a warmed AI workload can be checkpointed and restored with
+much of its runtime state intact.
+
+The most important lesson is:
+
+> Restoring an AI server is not the same as loading a model again. It means
+> restoring the complete CPU and GPU runtime that makes the model ready to
+> serve.
+
+For the validated Gemma experiment, that reduced time-to-ready from 104.158
+seconds to 11.060 seconds.
+
+The project began as an attempt to reduce startup time. It became a journey
+into understanding what a running AI workload really is.
