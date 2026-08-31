@@ -11,8 +11,6 @@ draft: false
 import Mermaid from '../../components/Mermaid.astro';
 import VegaChart from '../../components/VegaChart.astro';
 
-# Edo Tensei: Checkpoint and Restore Live AI Workloads
-
 Modern AI servers can take minutes to become ready.
 
 They may need to load model weights, initialize CUDA, compile kernels, capture
@@ -26,6 +24,17 @@ I explored that question by learning Rust, Linux process internals, CRIU, CUDA
 checkpointing, and vLLM runtime behavior.
 
 The result is an experimental checkpoint and restore runtime for AI workloads.
+
+On one H100, a validated Gemma 3 27B QAT workload went from **104.158s on a
+warm-cache cold boot to 11.060s from restore**, a **9.4× reduction in
+time-to-ready**. The restored server returned valid inference without reloading
+the model or recapturing CUDA Graphs.
+
+The comparison is deliberately qualified: 104.158s is the reproducible
+warm-cache cold-boot measurement. A first-ever boot took about 180s because it
+also paid compilation, autotuning, and cache-creation costs. Restore completed
+in 11.060s from a **32 GiB same-host snapshot**, with the request-specific KV
+cache recreated after restore.
 
 <Mermaid
 title="Cold start versus restore"
@@ -81,6 +90,8 @@ Cold boot versus Edo tensei restore:
 />
 
 The chart compares cold boot with Edo Tensei restore time for each workload.
+
+<p class="repo-cta"><span>Read the implementation</span><a href="https://github.com/tsdocode/edo-tensei">GitHub → tsdocode/edo-tensei</a></p>
 
 The restored server returned valid inference output without reloading the
 model or recapturing CUDA Graphs.
@@ -292,18 +303,23 @@ That made me ask a lower-level question:
 > Can CUDA checkpointing be coordinated with Linux process checkpointing so an
 > entire AI workload can continue after restore?
 
-A running CUDA process may contain:
-
-- a CUDA context;
-- GPU memory allocations;
-- CUDA streams;
-- CUDA events;
-- compiled kernels;
-- CUDA Graphs;
-- allocator state.
+A running CUDA process may contain CUDA-managed execution state, including GPU
+memory. In the validated vLLM run, CUDA Graphs resumed without recapture.
 
 CRIU understands Linux process state, but it does not automatically understand
 all of the state managed by the NVIDIA driver and CUDA runtime.
+
+## Related work
+
+Edo Tensei is not an attempt to claim checkpoint and restore as a new idea.
+Modal has described [GPU memory snapshots](https://modal.com/blog/gpu-mem-snapshots),
+and NVIDIA's [Dynamo Snapshot](https://docs.nvidia.com/dynamo/dev/digest/dynamo-snapshot-fast-startup)
+combines `cuda-checkpoint`, CRIU, and orchestration around warm inference
+workers. NVIDIA reports a prototype reduction of up to 21× for startup.
+
+The useful contribution here is narrower and practical: building and exposing
+the stack as a Rust runtime, handling real vLLM process trees, discovering the
+`io_uring` failure, patching CRIU, and validating the complete path end to end.
 
 The CUDA lifecycle became:
 
@@ -555,6 +571,8 @@ export EDO_BIN=target/debug/edo
 The vLLM workflow requires a compatible Linux host, NVIDIA GPU, CUDA
 installation, vLLM environment, and the experimental CRIU fork with io_uring
 support.
+
+<p class="repo-cta"><span>Explore the source and experiments</span><a href="https://github.com/tsdocode/edo-tensei">GitHub → tsdocode/edo-tensei</a></p>
 
 ## Conclusion
 

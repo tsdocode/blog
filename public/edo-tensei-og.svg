@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#f7f7f8"/>
+  <path stroke="#e2e5e8" d="M0 126h1200M0 252h1200M0 378h1200M0 504h1200M120 0v630M240 0v630M360 0v630M480 0v630M600 0v630M720 0v630M840 0v630M960 0v630M1080 0v630"/>
+  <rect x="78" y="76" width="52" height="52" rx="12" fill="#5146f5"/>
+  <path d="m104 88-11 14 11 14m8-28 11 14-11 14" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="150" y="113" fill="#111318" font-family="Arial, sans-serif" font-size="25" font-weight="700">tsdocode / systems note</text>
+  <text x="78" y="250" fill="#111318" font-family="Arial, sans-serif" font-size="58" font-weight="700">Edo Tensei</text>
+  <text x="78" y="318" fill="#111318" font-family="Arial, sans-serif" font-size="36">Checkpoint and restore</text>
+  <text x="78" y="363" fill="#111318" font-family="Arial, sans-serif" font-size="36">live AI workloads</text>
+  <path d="M78 440h1044" stroke="#cdd2d7"/>
+  <text x="78" y="515" fill="#5146f5" font-family="Arial, sans-serif" font-size="54" font-weight="700">104.2s → 11.1s</text>
+  <text x="78" y="558" fill="#68717b" font-family="Arial, sans-serif" font-size="23">9.4× faster · vLLM · CUDA · H100</text>
+</svg>
