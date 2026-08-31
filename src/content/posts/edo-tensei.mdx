@@ -425,6 +425,19 @@ valid.
 | CUDA Graph recapture | Yes | No |
 | Valid output | `Ready.` | `Ready.` |
 
+The validated workload comparison shows the same pattern at different scales:
+
+<Mermaid
+  title="Cold boot versus Edo Tensei restore"
+  chart={`xychart-beta
+    title "Time to ready across validated workloads"
+    x-axis ["CPU process", "Qwen3-0.6B + vLLM", "Gemma 3 27B + vLLM"]
+    y-axis "Time to ready (seconds)" 0 --> 110
+    bar [2.102, 30.046, 104.158]
+    bar [0.164, 3.368, 11.060]
+`}
+/>
+
 The time-to-ready improvement was approximately:
 
 ```text
