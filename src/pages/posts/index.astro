@@ -1,0 +1,32 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+const baseUrl = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const posts = (await getCollection('posts', ({ data }) => !data.draft)).sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+const formatDate = (date: Date) => date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+---
+
+<BaseLayout title="All posts" description="All systems, AI, and open-source notes by tsdocode.">
+  <div class="shell landing default-landing">
+    <section class="landing-intro">
+      <div>
+        <div class="breadcrumbs"><a href={baseUrl}>tsdocode / blog</a> / posts</div>
+        <h1>All<br /><em>notes.</em></h1>
+      </div>
+      <p>A running collection of systems, AI infrastructure, and engineering notes.</p>
+    </section>
+
+    {posts.length ? <section class="latest-section posts-index-section">
+      <div class="section-heading"><h2>Published notes</h2><span class="mono">{String(posts.length).padStart(2, '0')} posts</span></div>
+      <div class="notes-list">
+        {posts.map((post, index) => <a class="note-row" href={`${baseUrl}posts/${post.id}/`}>
+          <span class="note-number mono">{String(index + 1).padStart(2, '0')}</span>
+          <span class="note-main"><span class="post-kicker">{post.data.category} · {post.data.tags.slice(0, 2).join(' / ')}</span><strong>{post.data.title}</strong><p>{post.data.description}</p></span>
+          <span class="note-date">{formatDate(post.data.date)}<br /><small>{post.data.readTime}</small></span>
+          <span class="row-arrow">↗</span>
+        </a>)}
+      </div>
+    </section> : <section class="default-welcome"><div class="welcome-number mono">00 / published notes</div><div><span class="post-kicker">The notebook is open</span><h2>No posts published yet.</h2><p class="manifesto">Notes from building things close to the metal.</p></div></section>}
+  </div>
+</BaseLayout>

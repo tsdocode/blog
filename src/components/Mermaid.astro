@@ -14,8 +14,13 @@ const { chart, title = 'Mermaid diagram' } = Astro.props;
 <script>
   import mermaid from 'mermaid';
 
-  const diagrams = document.querySelectorAll('.mermaid[data-chart]');
+  // Astro bundles this component script once per page, so discover all
+  // diagrams here and render them sequentially. Sequential rendering keeps
+  // Mermaid's shared parser state from being used concurrently.
   const renderDiagrams = async () => {
+    const diagrams = [...document.querySelectorAll<HTMLElement>('.mermaid[data-chart]')];
+    if (!diagrams.length) return;
+
     const isDim = document.documentElement.classList.contains('dim');
     mermaid.initialize({
       startOnLoad: false,
@@ -43,12 +48,19 @@ const { chart, title = 'Mermaid diagram' } = Astro.props;
       flowchart: { useMaxWidth: true, htmlLabels: false }
     });
 
-    diagrams.forEach((diagram) => {
-      diagram.removeAttribute('data-processed');
+    for (const [index, diagram] of diagrams.entries()) {
+      const chart = diagram.getAttribute('data-chart') ?? '';
       diagram.innerHTML = '';
-      diagram.textContent = diagram.getAttribute('data-chart') ?? '';
-    });
-    if (diagrams.length) await mermaid.run({ nodes: diagrams });
+
+      try {
+        const id = `mermaid-diagram-${index}`;
+        const { svg, bindFunctions } = await mermaid.render(id, chart);
+        diagram.innerHTML = svg;
+        bindFunctions?.(diagram);
+      } catch (error) {
+        console.error('Unable to render Mermaid diagram:', chart, error);
+      }
+    }
   };
 
   renderDiagrams();

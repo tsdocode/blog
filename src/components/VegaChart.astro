@@ -1,0 +1,55 @@
+---
+interface Props {
+  spec: Record<string, unknown>;
+  title?: string;
+}
+
+const { spec, title = 'Data visualization' } = Astro.props;
+---
+
+<figure class="vega-frame">
+  <div class="vega-chart" data-spec={JSON.stringify(spec)} role="img" aria-label={title}></div>
+</figure>
+
+<script>
+  import embed from 'vega-embed';
+
+  const charts = [...document.querySelectorAll<HTMLElement>('.vega-chart[data-spec]')];
+  const renderCharts = async () => {
+    const isDim = document.documentElement.classList.contains('dim');
+
+    for (const chart of charts) {
+      const spec = JSON.parse(chart.getAttribute('data-spec') ?? '{}');
+      chart.innerHTML = '';
+
+      await embed(chart, {
+        ...spec,
+        background: 'transparent',
+        config: {
+          ...spec.config,
+          font: 'ui-sans-serif, system-ui, sans-serif',
+          axis: {
+            ...spec.config?.axis,
+            labelColor: isDim ? '#aab4bb' : '#68717b',
+            titleColor: isDim ? '#f2f4f5' : '#111318',
+            domainColor: isDim ? '#33434d' : '#d8dde2',
+            tickColor: isDim ? '#33434d' : '#d8dde2',
+            gridColor: isDim ? '#24323a' : '#edf0f2'
+          },
+          legend: {
+            ...spec.config?.legend,
+            labelColor: isDim ? '#aab4bb' : '#68717b',
+            titleColor: isDim ? '#f2f4f5' : '#111318'
+          },
+          title: {
+            ...spec.config?.title,
+            color: isDim ? '#f2f4f5' : '#111318'
+          }
+        }
+      }, { actions: false, renderer: 'svg' });
+    }
+  };
+
+  renderCharts();
+  document.addEventListener('tsdocode:theme-change', renderCharts);
+</script>
