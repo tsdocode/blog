@@ -3,7 +3,7 @@ title: "Inf2 is so underrated: 64 real-time TTS streams on one Inferentia2 chip"
 description: "I ported a Qwen3-TTS serving engine to AWS Inferentia2 and hand-wrote its hot path in NKI. One inf2.xlarge now streams 64 voices faster than real time, with steady-state p99 time-to-first-audio of 279 ms."
 category: AI, inference, kernels
 date: 2026-10-22
-readTime: 22 min read
+readTime: 26 min read
 tags: [inferentia2, aws-neuron, nki, kernels, tts, qwen3-tts, inference]
 draft: false
 ogImage: inf2-og.svg
@@ -286,20 +286,192 @@ from row 3 on, so its per-step share is half a call. Row 1 is the sum of the com
 
 ## Step 4: two cores, 64 streams
 
-With both cores serving, 32 streams each, the load test started at RTF 1.19 — about 19% too slow. Each step was
-profiled again, and each fix was load-tested:
+With both cores serving, 32 streams each, the first 64-stream load test (`neuron/engine/loadtest.py`: 64 clients,
+each streaming a request and sending the next as soon as it finishes, 90 s) came back too slow. (Outputs in this
+section are trimmed to the relevant lines and fields; `/stats` JSON is summarised.)
 
-| Change | What found it | RTF at 64 streams |
+```text
+concurrency 64, 96s: 1061 requests ok, 0 errors
+    | audio 4984s -> 51.8x real time aggregate
+TTFA ms: p50 378 | p90 431 | p95 614 | p99 896 | max 928
+steady-state TTFA ms (after the first 10s): p50 375 | p95 426 | p99 445
+playback stalls: 99.9% of requests stalled > 50 ms; RTF p50 1.19
+/stats  core 0: step_ms p50 86.2  p90 136.2  |  core 1: p50 78.6  p90 133.9
+```
+
+**How to read it.** RTF 1.19 means each stream's audio took 1.19 s to generate per second of speech, so playback
+stalls (99.9% of requests did). The `/stats` endpoint shows why: a step takes 79–86 ms at the median and ~135 ms at
+p90, against an 80 ms budget per frame. Four investigations followed, each ending in another load test.
+
+### 1. Two engines, one Python process
+
+**Observation.** The same engine on *one* core with 32 streams had run at RTF 0.99. Two engines in one process, at the
+same 32 streams per core, ran at 1.19 — 20% slower — with identical kernels. So the extra time was not on the device.
+
+**Investigation.** The device kernels are unchanged, so the difference must be host-side: each engine step has
+5–8 ms of Python (batch building, sampling, sending audio), the instance has 4 vCPUs, and two engines in one interpreter
+share the GIL. Test: one server process per NeuronCore (`NEURON_RT_VISIBLE_CORES=0` and `=1`) behind a small streaming
+router.
+
+```text
+concurrency 64, 96s: 1143 requests ok, 0 errors
+    | audio 5403s -> 56.2x real time aggregate
+steady-state TTFA ms (after the first 10s): p50 342 | p95 389 | p99 425
+playback stalls: 96.7% of requests stalled > 50 ms; RTF p50 1.09
+/stats  core 0: step_ms p50 77.1  p90 124.2  |  core 1: p50 82.1  p90 123.7
+```
+
+**Result.** 1.19 → 1.09. Better, still over budget. The next question was where the remaining ~80 ms went — so I added a
+per-phase breakdown to `/stats` and went back to profiling one stage at a time.
+
+### 2. The codec's front transformer: a DMA problem in disguise
+
+**Investigation.** The codec was the biggest phase, so I broke one codec call (2 frames for 32 streams) into stages, each
+timed with a device sync (`neuron/bench/bench_codec_stream.py`):
+
+```text
+B=32 F=2: full chunk 36.7 ms (18.4 ms per frame)
+    front pre (compiled)        1.24 ms
+    front transformer (NKI)    12.14 ms     <- an 8-layer, 64-token transformer
+    front post (compiled)       3.49 ms
+    block0 transconv            2.25 ms
+    (16 more conv kernels)      0.5 - 2.0 ms each   (summarised)
+```
+
+A transformer this small (59 MB of weights, 64 tokens) should take about a millisecond. The first guess — it issues
+~8,200 small DMAs per call, so batch them — took it only from 12.1 to 11.3 ms. So I profiled the kernel itself:
+
+```text
+[cfront_b32] device 11510.7 us
+    | HBM rd 153.66 MB wr 74.58 MB | eff 13 GB/s read
+    | DMA 94% TensorE 2% VectorE 27% ScalarE 3% GpSimd 0%   (one line, wrapped)
+```
+
+**How to read it.** DMA is 94% busy but moving only 13 GB/s, against 257 GB/s possible: the DMA engines are busy with
+*descriptors*, not bytes. The kernel was copying its attention state into a slice, `kall[:, :, 0:R]`, of a wider SBUF
+tile — so every partition's destination was strided, and each copy split into 128 × 32 descriptors of ~140 bytes.
+Staging through a contiguous tile and copying on chip:
+
+```text
+[cfront_b32b] device 3758.5 us
+    | HBM rd 153.66 MB wr 74.58 MB | eff 41 GB/s read
+    | DMA 25% TensorE 7% VectorE 93% ScalarE 8% GpSimd 1%   (one line, wrapped)
+```
+
+Same bytes, 3× faster. Now the **Vector Engine** is the bottleneck (93%) and the Scalar Engine idle (8%), so the staging
+copies moved to ScalarE: **3.3 ms**. The whole codec call: **36.7 → 27.9 ms.**
+
+### 3. The code predictor: 31 launches per frame
+
+**Investigation.** The engine's per-phase timings (device-synced) put the code predictor at **18.7 ms** per frame,
+but its 16 step kernels alone had benchmarked at **12.6 ms**. The other 6 ms was everything between them: 16 kernel
+launches, 15 launches of a small compiled sampler, and the hand-offs between them. Test: one kernel for the whole
+frame — 16 depth steps, top-50 sampling and the embedding lookups on chip (`neuron/tests/test_cp_frame.py`, same
+random numbers on both paths):
+
+```text
+greedy=True:  token agreement 100.0% (first mismatches [])
+greedy=False: token agreement 100.0% (first mismatches [])
+per-step (16 cp_step + 15 sampler): 19.00 ms per frame (B=32, incl. D2H)
+cp_frame (1 launch):                14.33 ms per frame (B=32, incl. D2H)
+```
+
+Building it needed two more investigations — two instructions that compile on their own but not on this chip
+generation inside the kernel, found by compiling one-instruction probe kernels and then bisecting the sampler with
+early returns ([details](/blog/inf2/kernels/cp-frame/)). With both fixes in, the load test:
+
+```text
+concurrency 64, 94s: 1437 requests ok, 0 errors
+    | audio 6710s -> 71.3x real time aggregate
+steady-state TTFA ms (after the first 10s): p50 276 | p95 311 | p99 325
+playback stalls: 1.3% of requests stalled > 50 ms; RTF p50 0.88
+```
+
+**Result.** Real time: **1.09 → 0.88**.
+
+### 4. Prefill steps and host Python
+
+The new per-phase `/stats` from that run (mean ms per step, core 0):
+
+```text
+step_mean 66.33   prefill_steps_pct 30.29
+  host: build talker batch     5.51
+  codec_head + D2H            21.22    <- waits for the talker
+  host: talker sampling        4.73
+  code predictor (cp_frame)   15.93
+  host: emit audio + finish    2.23
+  codec chunk                 14.92
+```
+
+**Two leads.** About 30% of steps carry new prompts, and **12.5 ms per step is host Python** (batch build + sampling +
+emit).
+
+**Prefill, investigated with the kernel benchmark** (`neuron/bench/bench_talker_step.py`, 32 decode streams):
+
+```text
+decode only                                  22.4 ms
++ 1 prompt (64 tokens)                       23.7 ms
++ 8 prompts (8 x 64 = 512 tokens, T=544)     65.4 ms
++ 8 prompts, attention switched off          37.7 ms
+```
+
+8 prompts add 43 ms. Switching attention off removes 28 ms (decode and prefill attention together), so most of the cost
+is in the layers themselves. Two causes, each confirmed separately:
+
+- **Padding.** Real prompts are 17–32 tokens, padded to 64 — half the prefill work was padding.
+- **T = 544.** The profile of the dense layers alone at T = 32 shows one matmul per weight tile per step — 84,368 of
+  them. The profile of the 544-token step (attention included) issued 284,544:
+
+  ```text
+  [talker_dense] T=32,  attention off   tensor MATMUL n= 84368
+  [talker_pack4] T=544, attention on    tensor MATMUL n=284544
+  ```
+
+  A matmul's moving tile holds at most 512 tokens, so at T = 544 every weight tile needs a full 512-column matmul
+  *plus* a 32-column one — about 84,000 extra matmuls before attention is even counted. A microbenchmark of a single matmul put the cost of that tail at the per-instruction floor:
+
+  ```text
+  M= 128 N=   2   133.3 ns per matmul
+  M= 128 N= 128   135.1 ns per matmul
+  M= 128 N= 512   345.1 ns per matmul
+  ```
+
+  86,000 extra ~130 ns matmuls ≈ 11 ms.
+
+The fix for both: **pack prompts back to back into 128-token tiles** (varlen) and cap a step at 3 tiles, so T ≤ 416:
+
+```text
++ 9 prompts (3 packed tiles, T=416)          42.3 ms     (was 65.4 ms for 8)
+```
+
+**Host Python, investigated with CPU microbenchmarks** of the exact code paths, single-threaded like the server:
+
+```text
+talker sampling, 32 streams:  repetition penalty 0.47 ms | sample 3.16 ms
+  -> sample from the top-50 values only:                    0.91 ms
+attention metadata (Python loops -> vectorised):
+  decode:  1.09 -> 0.14 ms        prefill group:  3.48 -> 0.26 ms
+```
+
+With packed prefill and the host fixes, the load test:
+
+```text
+concurrency 64, 96s: 1572 requests ok, 0 errors
+    | audio 7380s -> 77.1x real time aggregate
+TTFA ms: p50 246 | p90 265 | p95 279 | p99 669
+steady-state TTFA ms (after the first 10s): p50 245 | p95 267 | p99 279
+playback stalls: 0.9% of requests stalled > 50 ms; RTF p50 0.79
+/stats  core 0: step_mean 60.2 ms (host 7.4)  |  core 1: step_mean 60.7 ms
+```
+
+**Result: RTF 0.79**, 77× real time on one chip, steady-state p99 time to first audio 279 ms.
+
+| Change | Found by | RTF at 64 streams |
 | --- | --- | ---: |
-| (starting point) two engines in one process | — | 1.19 |
-| one process per core, behind a small router | per-step host time grew when the second engine ran: two engines, one GIL | 1.09 |
-| codec front transformer 12.1 → 3.3 ms | device profile: DMA 94% busy at 13 GB/s → strided SBUF destinations, 32× too many descriptors | |
-| code predictor frame in one launch, sampling on chip | per-phase timings: 31 launches per frame | 0.88 |
-| varlen packed prefill, prompts ≤ 512 tokens per step | kernel bench: 8 prompts cost 63 ms; profile: T = 544 doubled every weight matmul | |
-| vectorised host sampling and attention metadata | per-phase `/stats` under load: 12.5 ms of host Python per step | 0.79 |
-
-The details of each are in the guide: [the DMA-descriptor bug](/blog/inf2/kernels/codec-front-transformer/),
-[the one-launch code predictor](/blog/inf2/kernels/cp-frame/) and [packed prefill](/blog/inf2/kernels/packed-prefill/).
+| (start) two engines in one process | load test + `/stats` | 1.19 |
+| one process per core | comparing with the 1-core run (0.99) | 1.09 |
+| codec front DMA fix, one-launch code predictor | stage timing → device profile; per-phase timing | 0.88 |
+| packed prefill, host fixes | per-phase `/stats` → kernel bench + profile counts; CPU microbenchmarks | 0.79 |
 
 ## The toolkit: how the problems were actually found
 
