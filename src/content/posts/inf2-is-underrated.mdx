@@ -3,7 +3,7 @@ title: "Inf2 is so underrated: 64 real-time TTS streams on one Inferentia2 chip"
 description: "I ported a Qwen3-TTS serving engine to AWS Inferentia2 and hand-wrote its hot path in NKI. One inf2.xlarge now streams 64 voices faster than real time, with steady-state p99 time-to-first-audio of 279 ms."
 category: AI, inference, kernels
 date: 2026-10-22
-readTime: 14 min read
+readTime: 18 min read
 tags: [inferentia2, aws-neuron, nki, kernels, tts, qwen3-tts, inference]
 draft: false
 ogImage: inf2-og.svg
@@ -19,7 +19,7 @@ import '../../styles/guide.css';
 Ask people what to serve a speech model on and you will hear "a GPU". Almost nobody says Inferentia2 — AWS's
 inference chip, sitting in an instance that costs about the same as a single small GPU.
 
-I spent a few days finding out what it can actually do. I took
+Over about 19 hours across two days I found out what it can actually do. I took
 [nari-labs/nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts), a high-throughput serving engine for
 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) built for an H100, and ported it to one **inf2.xlarge**, writing the
 hot path as hand-tuned kernels in AWS's kernel language, NKI.
@@ -27,7 +27,8 @@ hot path as hand-tuned kernels in AWS's kernel language, NKI.
 The result: **64 concurrent streaming voices on one chip, each generated faster than real time** (real-time factor
 0.79), **77× real time in aggregate**, and a steady-state p99 time to first audio of **279 ms**.
 
-This post is the story and the lessons. Alongside it I wrote an
+This post is how it actually went — compile, profile, replace each stage with a kernel, integrate, debug — and,
+more than the final numbers, **how each problem was found**. Alongside it I wrote an
 [**Inferentia2 Field Guide**](/blog/inf2/) — short, cross-linked pages that explain the chip one component at a time,
 because almost nothing like it exists. Links in this post jump into it.
 
@@ -64,87 +65,161 @@ a <T id="hardware/dma">DMA</T> you asked for.
 On paper the chip has 820 GB/s of memory bandwidth and 190 dense bf16 TFLOPS. I measured 257 GB/s into one core and
 about 508 GB/s with both cores streaming. For comparison, an NVIDIA L4 lists 300 GB/s and 121 dense bf16 TFLOPS.
 
-## Why I had to write kernels
+## Step 0: ground truth before speed
 
-The first port used the Neuron compiler on the PyTorch graphs. Per 32 streams it needed:
+Before optimising anything I generated the answers I would check against: the upstream model run on the CPU in
+fp32, greedy, on two prompts (22 and 74 frames) — the exact codec tokens and the audio. Every kernel and every engine
+change after that was measured against this golden output, and against a layer-by-layer fp32 oracle for single kernels.
 
-| Stage | Compiled graphs |
-| --- | ---: |
-| Talker step | 29.6 ms |
-| Code predictor, 16 steps | 32.1 ms |
-| Codec decoder (fp32) | 37.5 ms |
-| **Total** | **99.2 ms — over the 80 ms budget** |
+That mattered more than I expected. This talker drifts a lot in bf16 — upstream PyTorch in bf16 on the CPU diverges
+from fp32 after a few frames too — so "matches fp32 exactly" is the wrong bar. The bar became **"as close to fp32 as
+CPU bf16 is"**, checked with teacher forcing: feed the golden tokens back in and compare each step's prediction.
 
-The profiles showed why: tens of thousands of tiny instructions per step, thousands of transposes, intermediate
-tensors spilling to HBM between ops. A transformer graph compiles well; a serving loop with paged attention, sampling
-and a streaming audio codec does not. So the hot path became <T id="programming/nki">NKI</T> kernels: Python functions
-in which you place every tile in on-chip memory and issue every engine instruction yourself. The guide has
-[a 60-line first kernel](/blog/inf2/programming/first-kernel/) explained line by line.
+I also measured the hardware instead of trusting the datasheet: a streaming kernel moved **257 GB/s** into one core and
+**~508 GB/s** with both cores at once. Those two numbers became the floor every kernel was judged against.
 
-## The journey
+## Step 1: compile everything, then read the profiles
+
+The first port was plain PyTorch, each component compiled with `torch.compile(backend="neuron")`, 32 streams per core:
+
+| Component | Compiled | What the profile showed |
+| --- | ---: | --- |
+| Code predictor, 16 steps unrolled | 73.5 ms | 79% of HBM traffic was 320 hidden `scatter`s — in-place `kv_cache[...].copy_()` became a full-buffer scatter (12.2 GB per frame) |
+| Code predictor, one reusable step graph | 32.1 ms | instruction-overhead bound: ~19,000 matmuls per step with only 32 moving columns |
+| Talker decode step | 29.6 ms | ~3× its 10 ms bandwidth floor |
+| Codec decoder, fp32 | 37.5 ms | — |
+| Codec decoder, bf16 | 29.2 ms | only 22% faster, and **24.9 dB** audio — unusable: every SnakeBeta was several passes spilled to HBM (9.8 GB read per chunk), Tensor Engine 16% busy |
+| **Talker + CP + codec** | **99.2 ms** | **over the 80 ms budget** |
+
+Two more findings decided the plan. AWS's NKI-Lib — the library of prebuilt kernels — did not help: its MLP kernel
+failed to compile on this chip generation, and its attention kernels rely on Trainium2-only DMA features. And the
+compiler's problems were not one bottleneck but the same pattern everywhere: thousands of tiny instructions,
+transposes and spills. So: replace each stage with a hand-written <T id="programming/nki">NKI</T> kernel, one at a
+time, each validated before moving on.
+
+## Step 2: replace each stage with a kernel
+
+**A first kernel to learn the machine.** A fused RMSNorm + linear for decode
+([explained line by line](/blog/inf2/programming/first-kernel/)), plus an FP8 variant: 1.4× faster on weights, but
+2.6% error per matrix — too lossy for this model, so it stayed opt-in.
+
+**Codec: 37.5 → 9.4 ms, 52.6 dB.** Three kernels fuse each SnakeBeta with the convolution after it
+([codec convolutions](/blog/inf2/kernels/codec-convs/)). Two problems the per-block tests surfaced: the Scalar Engine's
+`sin` is only valid on [−π, π] while the arguments reach ±142 ([range reduction](/blog/inf2/patterns/sin-range-reduction/)),
+and for small channel counts the Vector Engine was the bottleneck, fixed by feeding SnakeBeta's two terms to the
+convolution as separate matmuls.
+
+**Code predictor: 32.1 → 12.6 ms**, as accurate as CPU bf16. One kernel per depth step: 5 layers, the KV slot written
+in place, norm weight and RoPE folded into one matrix per step
+([QK-norm and RoPE as matmuls](/blog/inf2/patterns/qk-norm-rope/)).
+
+**Talker: 29.6 → 22.9 ms, and the first version was 70 ms.** The fused 28-layer step was correct on the first full
+run — and more than twice as slow as the compiler. The kernel takes `do_kv_write` / `do_attention` switches, so an
+ablation took two runs: **49 of the 70 ms were the KV-cache writes.** The cache stored K dimension-major (ready for
+Q·Kᵀ), so each new token needed 128 tiny 16-byte DMA descriptors. Storing K token-major like V made each layer's write a
+single scatter DMA; K pages are now transposed on the Tensor Engine when read
+([paged KV attention](/blog/inf2/kernels/paged-kv-attention/)). On paper the three kernels now added up to ~45 ms.
+
+## Step 3: plug it into a serving engine
+
+A lockstep engine runs one step per 80 ms frame for 32 streams
+([lockstep batching](/blog/inf2/engine/lockstep-batching/)). Integration found the bugs that unit tests could not:
+
+- **Two silent corruptions, caught by the teacher-forced golden test.** The codec kernels dropped the last partial
+  tile whenever a chunk was not a multiple of 512 samples (whole-sequence tests passed; streaming audio was at −0.7 dB
+  SNR). And padding tokens' KV writes used an "out of bounds" row that was only out of bounds for one layer's *view* of
+  the cache — it was block 0 of the next layer, so every step overwrote one stream's first token. After both fixes: talker
+  codebook 0 matches fp32 100%, code predictor 96–97%, end of speech on the golden frame.
+- **Host sampling: 74 → 19 ms.** The code predictor's 15 sampling round trips per frame went on device.
+- **The codec's compiled front had a 28–33 ms fixed cost per call**, regardless of frames: 3.7 GB of HBM reads in about
+  371,000 small DMA packets around its transformer state. Two fixes: decode 2 frames every 2 steps
+  ([codec chunking](/blog/inf2/engine/codec-chunking/)), and its transformer became a kernel too.
+- **p95 time to first audio: 3 seconds.** The cause was a single multi-second step right after warm-up: the serving
+  thread called `torch.set_num_threads(1)`, a global that PyTorch's compiler guards on — so every compiled graph
+  recompiled on its first real step, stalling every stream for ~2.5 s. Set it once before warm-up: p95 dropped from
+  3,056 to 361 ms. The engine now logs a per-phase breakdown for any step over 300 ms, so the next stall explains itself.
+
+One core now ran 32 streams in real time (RTF 0.99).
 
 <VegaChart
-  title="64-stream load test: real-time factor per stream"
+  title="Measured step time on one core, 32 streams (device-synced)"
   spec={{
     "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
     width: "container",
-    height: 280,
+    height: 250,
+    data: { values: [
+      { m: "1. compiled", part: "talker", ms: 29.6 }, { m: "1. compiled", part: "code predictor", ms: 32.1 }, { m: "1. compiled", part: "codec", ms: 37.5 },
+      { m: "2. NKI, engine v1", part: "talker", ms: 19.0 }, { m: "2. NKI, engine v1", part: "code predictor", ms: 18.8 }, { m: "2. NKI, engine v1", part: "codec", ms: 48.7 }, { m: "2. NKI, engine v1", part: "host", ms: 4.0 },
+      { m: "3. chunked codec", part: "talker", ms: 19.0 }, { m: "3. chunked codec", part: "code predictor", ms: 18.7 }, { m: "3. chunked codec", part: "codec", ms: 18.8 }, { m: "3. chunked codec", part: "host", ms: 4.8 },
+      { m: "4. DMA fix + cp_frame", part: "talker", ms: 19.7 }, { m: "4. DMA fix + cp_frame", part: "code predictor", ms: 14.4 }, { m: "4. DMA fix + cp_frame", part: "codec", ms: 14.3 }, { m: "4. DMA fix + cp_frame", part: "host", ms: 4.3 }
+    ] },
+    transform: [{ calculate: "indexof(['talker', 'code predictor', 'codec', 'host'], datum.part)", as: "o" }],
     layer: [
-      { data: { values: [
-          { step: "1. one process", rtf: 1.19 },
-          { step: "2. process per core", rtf: 1.09 },
-          { step: "3. DMA fix + cp_frame", rtf: 0.88 },
-          { step: "4. varlen prefill", rtf: 0.79 }
-        ] },
-        mark: { type: "bar", color: "#5146f5", cornerRadiusEnd: 4 },
+      { mark: { type: "bar" },
         encoding: {
-          y: { field: "step", type: "nominal", sort: null, title: null, axis: { labelLimit: 140 } },
-          x: { field: "rtf", type: "quantitative", title: "real-time factor (1.0 = real time)", scale: { domain: [0, 1.3] } }
+          y: { field: "m", type: "nominal", sort: null, title: null, axis: { labelLimit: 130 } },
+          order: { field: "o", type: "quantitative" },
+          x: { field: "ms", type: "quantitative", stack: "zero", title: "ms per step (budget 80)", scale: { domain: [0, 105] } },
+          color: { field: "part", type: "nominal", sort: ["talker", "code predictor", "codec", "host"], scale: { range: ["#5146f5", "#10b981", "#f59e0b", "#9aa3ad"] }, legend: { orient: "bottom", title: null, columns: 2 } }
         } },
-      { data: { values: [{ x: 1 }] }, mark: { type: "rule", color: "#ef4444", strokeDash: [5, 4], strokeWidth: 2 },
+      { data: { values: [{ x: 80 }] }, mark: { type: "rule", color: "#ef4444", strokeDash: [5, 4], strokeWidth: 2 },
         encoding: { x: { field: "x", type: "quantitative" } } }
     ]
   }}
 />
 
-Before the first load test came the kernels: a fused 28-layer <T id="kernels/talker-step">talker step</T>
-with <T id="kernels/paged-kv-attention">paged KV attention</T>, a fused code-predictor step, the codec's
-<T id="kernels/codec-convs">SnakeBeta convolutions</T> and its <T id="kernels/codec-front-transformer">front transformer</T>.
-That got one core to real time with 32 streams. Getting **both cores** to real time — 64 streams — took four more steps:
+Rows 2–4 are the engine's own per-phase timings with a device sync after each phase; the codec runs every second step
+from row 3 on, so its per-step share is half a call. Row 1 is the sum of the compiled components measured separately.
 
-1. **Two engines, one process (RTF 1.19).** The kernels were fast enough, but each step also has ~10 ms of Python,
-   and two engines in one interpreter fought over the GIL.
-2. **One process per core (1.09).** Two server processes behind a tiny streaming router — see
-   <T id="engine/per-core-processes">one process per NeuronCore</T>.
-3. **A DMA bug and a one-launch code predictor (0.88).** The codec's front transformer was spending 12 ms moving its
-   attention state in 140-byte DMA descriptors; fixing the layout took it to 3.3 ms. The code predictor's 16 depth
-   steps plus sampling became [a single kernel launch](/blog/inf2/kernels/cp-frame/) with top-50 sampling on chip.
-4. **Varlen prefill and host fixes (0.79).** New prompts are packed back to back into 128-token tiles with a
-   block-diagonal causal mask — the FlashAttention-varlen idea, on a NeuronCore
-   ([packed prefill](/blog/inf2/kernels/packed-prefill/)) — and the host's Python was vectorised.
+## Step 4: two cores, 64 streams
+
+With both cores serving, 32 streams each, the load test started at RTF 1.19 — about 19% too slow. Each step was
+profiled again, and each fix was load-tested:
+
+| Change | What found it | RTF at 64 streams |
+| --- | --- | ---: |
+| (starting point) two engines in one process | — | 1.19 |
+| one process per core, behind a small router | per-step host time grew when the second engine ran: two engines, one GIL | 1.09 |
+| codec front transformer 12.1 → 3.3 ms | device profile: DMA 94% busy at 13 GB/s → strided SBUF destinations, 32× too many descriptors | |
+| code predictor frame in one launch, sampling on chip | per-phase timings: 31 launches per frame | 0.88 |
+| varlen packed prefill, prompts ≤ 512 tokens per step | kernel bench: 8 prompts cost 63 ms; profile: T = 544 doubled every weight matmul | |
+| vectorised host sampling and attention metadata | per-phase `/stats` under load: 12.5 ms of host Python per step | 0.79 |
+
+The details of each are in the guide: [the DMA-descriptor bug](/blog/inf2/kernels/codec-front-transformer/),
+[the one-launch code predictor](/blog/inf2/kernels/cp-frame/) and [packed prefill](/blog/inf2/kernels/packed-prefill/).
+
+## The toolkit: how the problems were actually found
+
+Almost every speedup in this project came from a measurement that contradicted what I assumed. The tools, in the order
+I reached for them:
+
+| Tool | Question it answers | What it found here |
+| --- | --- | --- |
+| **fp32 golden outputs + teacher forcing** | is it still correct? | the out-of-bounds padding bug and the dropped partial tiles — both silent, both invisible in unit tests |
+| **per-kernel test vs a reference** | is *this kernel* correct? | every kernel, before integration: hidden-state error vs fp32, token agreement, audio SNR |
+| **ablation switches in the kernel** | which part of the kernel is slow? | 49 of 70 ms in the talker's KV writes |
+| **device profile** (neuron-explorer) | which engine is the bottleneck, and why? | hidden scatters in the compiled CP; DMA-descriptor-bound codec front; Vector Engine at 93% with Scalar at 8% |
+| **microbenchmarks** | what does the hardware actually do? | 257 / 508 GB/s HBM; page gathers 243 GB/s via `scalar_offset`, half that via `vector_select`; ~130 ns per small matmul |
+| **probe kernels and bisection** | why does this not compile? | two NKI instructions that do not lower on this chip generation, found by compiling them one at a time |
+| **per-phase step timing + slow-step log** | where does a serving step's time go? | 12.5 ms of host Python per step; any step over 300 ms, broken down by phase |
+| **burst tests** | what does the worst user see? | the start-up burst's three waves of first audio |
+| **Python profiler on startup** | why does warm-up take 15 minutes? | 110 s per kernel variant spent re-tracing it just to compute a cache key |
+
+The pattern that kept repeating: the obvious fix was wrong, and a two-minute measurement found the real one. Fewer DMAs
+did not speed up the codec front; *bigger descriptors* did. The fused talker was not slow at math; it was slow at
+writing 16-byte rows. Warm-up was not compiling; it was tracing Python.
 
 ## Five lessons that only bite on Inferentia
 
-**1. Count instructions, not FLOPs.** A matmul with 2 moving columns costs about the same as one with 128 — roughly
-130 ns either way in my kernels — and one with 512 columns does 256× the work for 2.6× the time. Decode attention,
-with one query per stream, issues ~78,000 tiny matmuls per step and is now the slowest part of the talker.
-→ [The matmul cost model](/blog/inf2/performance/matmul-cost/)
-
-**2. A DMA costs its descriptors, not its bytes.** The same 37 MB of state moved at 13 GB/s or near full speed
-depending only on whether each partition's destination was contiguous.
-→ [DMA engines and descriptors](/blog/inf2/hardware/dma/)
-
-**3. Stay at or below 512 tokens per step.** A matmul's moving tile fits one 512-column PSUM bank. At 544 tokens every
-weight block ran a full matmul *plus* a 32-column one — 86,000 extra instructions, ~11 ms.
-→ [Static shape buckets](/blog/inf2/patterns/static-shape-buckets/)
-
-**4. Padding is not free.** A padded KV page or a padded prompt token costs exactly as much as a real one. Packing
-prompts instead of padding them to 64 tokens made a prefill step 1.7× cheaper per prompt.
-→ [Varlen packed prefill](/blog/inf2/kernels/packed-prefill/)
-
-**5. Your 15-minute cold start is probably Python.** Warm-up took 925 s per core with every binary already cached:
-each process re-traced every kernel variant just to compute its cache key. NKI's trace cache loads a variant in 1 s.
-→ [Cold start and the trace cache](/blog/inf2/engine/cold-start-trace-cache/)
+1. **Count instructions, not FLOPs.** A matmul with 2 moving columns costs about the same as one with 128, ~130 ns in
+   these kernels. → [The matmul cost model](/blog/inf2/performance/matmul-cost/)
+2. **A DMA costs its descriptors, not its bytes.** → [DMA engines and descriptors](/blog/inf2/hardware/dma/)
+3. **Stay at or below 512 tokens per step**, or every weight block runs a second, short matmul.
+   → [Static shape buckets](/blog/inf2/patterns/static-shape-buckets/)
+4. **Padding is not free** — a padded page or prompt token costs as much as a real one.
+   → [Varlen packed prefill](/blog/inf2/kernels/packed-prefill/)
+5. **Global state is part of the compiled graph**, and your cold start is probably Python.
+   → [Cold start and the trace cache](/blog/inf2/engine/cold-start-trace-cache/)
 
 ## Results
 
