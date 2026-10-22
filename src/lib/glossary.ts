@@ -18,9 +18,9 @@ export const GLOSSARY: GlossaryTerm[] = [
   { match: ['NEFF'], title: 'NEFF — Neuron Executable File Format', def: 'The compiled binary of a graph or kernel that the Neuron runtime loads and runs on a NeuronCore.', link: 'programming/tracing-and-compilation' },
   { match: ['NeuronCore', 'NeuronCores', 'NeuronCore-v2'], title: 'NeuronCore-v2', def: 'One core of the Inferentia2 chip (there are two): four engines — Tensor, Vector, Scalar, GpSimd — running in parallel around SBUF and PSUM.', link: 'hardware/neuroncore-v2' },
   { match: ['Inferentia2', 'Inf2', 'inf2'], title: 'Inferentia2', def: 'AWS’s second-generation inference chip: two NeuronCore-v2, 32 GiB HBM, 190 bf16 TFLOPS. The chip in inf2 instances.', link: 'hardware/inferentia2-chip' },
-  { match: ['Tensor Engine', 'TensorE'], title: 'Tensor Engine', def: 'The 128 × 128 systolic array that does matrix multiplies (~92 bf16 TFLOPS per core). One operand stays in the array (stationary), the other streams through (moving).', link: 'hardware/tensor-engine' },
-  { match: ['Vector Engine', 'VectorE'], title: 'Vector Engine', def: '128-lane engine for operations that combine several inputs: element-wise between two tiles, reductions, masks.', link: 'hardware/vector-engine' },
-  { match: ['Scalar Engine', 'ScalarE'], title: 'Scalar Engine', def: '128-lane engine for one-input element-wise math with hardware exp, silu, rsqrt, sin — computes f(x·scale + bias) per element.', link: 'hardware/scalar-engine' },
+  { match: ['Tensor Engine', 'Tensor-Engine', 'TensorE'], title: 'Tensor Engine', def: 'The 128 × 128 systolic array that does matrix multiplies (~92 bf16 TFLOPS per core). One operand stays in the array (stationary), the other streams through (moving).', link: 'hardware/tensor-engine' },
+  { match: ['Vector Engine', 'Vector-Engine', 'VectorE', 'Vector ops'], title: 'Vector Engine', def: '128-lane engine for operations that combine several inputs: element-wise between two tiles, reductions, masks.', link: 'hardware/vector-engine' },
+  { match: ['Scalar Engine', 'Scalar-Engine', 'ScalarE'], title: 'Scalar Engine', def: '128-lane engine for one-input element-wise math with hardware exp, silu, rsqrt, sin — computes f(x·scale + bias) per element.', link: 'hardware/scalar-engine' },
   { match: ['GpSimd'], title: 'GpSimd Engine', def: 'Eight programmable 512-bit vector processors on each NeuronCore, for custom ops and work the fixed-function engines cannot do.', link: 'hardware/gpsimd' },
   { match: ['TTFA'], title: 'TTFA — Time To First Audio', def: 'Time from sending a request to receiving its first audio byte — what a user feels as latency in streaming TTS.' },
   { match: ['RTF'], title: 'RTF — Real-Time Factor', def: 'Time to generate audio ÷ duration of that audio. Below 1.0 the stream is generated faster than it plays; above 1.0 playback stalls.' },
@@ -45,5 +45,7 @@ export const GLOSSARY: GlossaryTerm[] = [
   { match: ['L4'], title: 'NVIDIA L4', def: 'A small data-centre GPU (24 GB, 300 GB/s, 121 dense bf16 TFLOPS) — AWS g6 instances.' },
   { match: ['p50', 'p90', 'p95', 'p99'], title: 'Percentiles', def: 'p95 = the value 95% of requests were faster than. p50 is the median; p99 shows the slow tail.' },
   { match: ['vCPU', 'vCPUs'], title: 'vCPU', def: 'A virtual CPU thread of the instance’s host processor. An inf2.xlarge has 4.' },
+  { match: ['spill', 'spills', 'spilled'], ci: true, title: 'Spill', def: 'When intermediate data does not fit in on-chip SBUF, the compiler writes it out to HBM and reads it back later — extra memory traffic that does no useful work.' },
+  { match: ['descriptor', 'descriptors'], ci: true, title: 'DMA descriptor', def: 'One contiguous run of bytes in a DMA transfer. A copy into strided memory needs many descriptors, and each has a fixed cost — so descriptor count, not bytes, often sets DMA speed.', link: 'hardware/dma' },
   { match: ['PE'], title: 'PE — Processing Element', def: 'One multiply-accumulate cell of the Tensor Engine’s 128 × 128 systolic array.' }
 ];

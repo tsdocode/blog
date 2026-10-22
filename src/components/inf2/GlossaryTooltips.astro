@@ -30,19 +30,19 @@ const terms = GLOSSARY.map((t) => ({ ...t, href: t.link ? `${guideBase()}${t.lin
     const reCi = new RegExp(`(?<![\\w-])(${insensitive.sort(byLength).map(esc).join('|')})(?![\\w-])`, 'gi');
     const skip = 'pre, code, a, h1, h2, h3, h4, h5, h6, svg, figure, .gl-term, .callout-label, .stat small, .guide-short';
 
-    // walk text in document order; marking restarts at every h2, so each term is marked once per section
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
-      acceptNode: (n) => {
-        if (n.nodeType === Node.ELEMENT_NODE) return (n as Element).tagName === 'H2' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        return n.parentElement?.closest(skip) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-      }
+    // mark the first occurrence of each term per paragraph-level block (p, li, table cell, callout, …), so every
+    // paragraph has its own hover targets without underlining the same word twice in one paragraph
+    const blockSel = 'p, li, td, th, blockquote, figcaption, dd, dt, .stat, .callout-body, .guide-related a';
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement?.closest(skip) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
     });
-    const nodes: (Text | 'section')[] = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode.nodeType === Node.ELEMENT_NODE ? 'section' : (walker.currentNode as Text));
-    let seen = new Set<Term>();
-
+    const nodes: Text[] = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+    const seenByBlock = new Map<Element, Set<Term>>();
     for (const node of nodes) {
-      if (node === 'section') { seen = new Set(); continue; }
+      const block = node.parentElement?.closest(blockSel) ?? body;
+      let seen = seenByBlock.get(block);
+      if (!seen) seenByBlock.set(block, (seen = new Set()));
       const text = node.data;
       const hits: { start: number; end: number; term: Term }[] = [];
       for (const [re, ci] of [[reExact, false], [reCi, true]] as const) {
