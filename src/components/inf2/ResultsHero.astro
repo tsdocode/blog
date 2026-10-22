@@ -1,0 +1,80 @@
+---
+// Results panel for the essay: headline numbers, 64 animated "voices", and the 80 ms step budget. All numbers are the
+// measured 64-stream load test (90 s, one inf2.xlarge) and the per-phase /stats of that run.
+const voices = Array.from({ length: 64 }, (_, i) => ({
+  delay: ((i * 37) % 64) / 64 * 1.2,        // deterministic pseudo-random phase
+  speed: 0.7 + ((i * 53) % 17) / 17 * 0.7
+}));
+// core 0 /stats of the 0.79 run: talker = launch 1.88 + wait for its output 20.29; host = batch 3.12 + sampling 2.07 +
+// sending audio 2.24; code predictor 15.81; codec 14.80 (averaged per step) -> 60.2 ms, the measured mean step
+const budget = [
+  { part: 'talker', ms: 22.2, cls: 'rb-talker' },
+  { part: 'code predictor', ms: 15.8, cls: 'rb-cp' },
+  { part: 'codec', ms: 14.8, cls: 'rb-codec' },
+  { part: 'host', ms: 7.4, cls: 'rb-host' }
+];
+const used = budget.reduce((a, b) => a + b.ms, 0);
+---
+<section class="results-hero" aria-label="Load test results">
+  <div class="rh-stats">
+    <div class="rh-stat"><strong>64</strong><span>concurrent streaming voices</span><small>one inf2.xlarge · 0 errors</small></div>
+    <div class="rh-stat"><strong>0.79</strong><span>real-time factor per stream</span><small>generated 1.27× faster than it plays</small></div>
+    <div class="rh-stat"><strong>279<em>ms</em></strong><span>p99 time to first audio</span><small>steady state · target &lt; 500 ms</small></div>
+    <div class="rh-stat"><strong>77<em>×</em></strong><span>real time, aggregate</span><small>7,380 s of audio in 96 s</small></div>
+  </div>
+
+  <div class="rh-voices" role="img" aria-label="64 concurrent streams">
+    <div class="rh-grid">
+      {voices.map((v) => <span class="rh-voice" style={`--d:${v.delay.toFixed(2)}s;--s:${v.speed.toFixed(2)}s`}><i /><i /><i /></span>)}
+    </div>
+    <p class="rh-caption mono">64 streams · 32 per NeuronCore · every one playing in real time</p>
+  </div>
+
+  <div class="rh-budget">
+    <div class="rh-budget-head"><span class="mono">one engine step = one 80 ms audio frame</span><span class="mono">{used.toFixed(0)} ms used · {(80 - used).toFixed(0)} ms headroom</span></div>
+    <div class="rh-track">
+      {budget.map((b) => <span class={`rh-seg ${b.cls}`} style={`width:${(b.ms / 80 * 100).toFixed(2)}%`} title={`${b.part}: ${b.ms} ms`}><em>{b.part}</em></span>)}
+      <span class="rh-seg rh-free" style={`width:${((80 - used) / 80 * 100).toFixed(2)}%`}><em>headroom</em></span>
+    </div>
+    <div class="rh-scale mono"><span>0</span><span>20</span><span>40</span><span>60</span><span>80 ms</span></div>
+  </div>
+</section>
+
+<style>
+  .results-hero { margin: 30px 0 34px; display: grid; gap: 14px; }
+  .rh-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .rh-stat { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; background: linear-gradient(160deg, var(--accent-soft), var(--surface) 70%); }
+  .rh-stat strong { display: block; font-size: clamp(30px, 4.2vw, 44px); line-height: 1; letter-spacing: -.06em; color: var(--accent); }
+  .rh-stat strong em { font-style: normal; font-size: .5em; letter-spacing: -.02em; margin-left: 2px; }
+  .rh-stat span { display: block; margin-top: 8px; font-size: 13px; font-weight: 600; line-height: 1.3; color: var(--text); }
+  .rh-stat small { display: block; margin-top: 4px; font-size: 11px; line-height: 1.35; color: var(--muted); }
+
+  .rh-voices { border: 1px solid var(--line); border-radius: 14px; padding: 18px; background: #0b1418; }
+  .rh-grid { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 6px; }
+  .rh-voice { display: flex; align-items: flex-end; justify-content: center; gap: 2px; height: 30px; border-radius: 6px; background: #122028; padding: 4px; }
+  .rh-voice i { display: block; width: 3px; border-radius: 2px; background: linear-gradient(#8b82ff, #36d4ae); height: 30%; animation: rh-eq var(--s) ease-in-out var(--d) infinite alternate; }
+  .rh-voice i:nth-child(2) { animation-delay: calc(var(--d) + .15s); animation-duration: calc(var(--s) * .8); }
+  .rh-voice i:nth-child(3) { animation-delay: calc(var(--d) + .3s); animation-duration: calc(var(--s) * 1.15); }
+  @keyframes rh-eq { 0% { height: 18%; } 50% { height: 85%; } 100% { height: 40%; } }
+  .rh-caption { margin: 12px 0 0 !important; color: #a7b6b9; font-size: 11px; text-align: center; max-width: none !important; }
+
+  .rh-budget { border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px 12px; background: var(--surface); }
+  .rh-budget-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+  .rh-budget-head span:last-child { color: var(--accent); font-weight: 600; }
+  .rh-track { display: flex; height: 34px; border-radius: 8px; overflow: hidden; background: var(--surface-muted); }
+  .rh-seg { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .rh-seg em { font-style: normal; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; }
+  .rb-talker { background: #5146f5; }
+  .rb-cp { background: #10b981; }
+  .rb-codec { background: #f59e0b; }
+  .rb-host { background: #9aa3ad; }
+  .rh-free { background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--accent) 18%, transparent) 6px 12px); color: var(--accent); border-left: 2px dashed var(--accent); }
+  .rh-scale { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 6px; }
+
+  @media (max-width: 760px) {
+    .rh-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .rh-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+    .rh-seg em { font-size: 9px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .rh-voice i { animation: none; height: 55%; } }
+</style>

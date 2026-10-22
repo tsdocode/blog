@@ -15,6 +15,7 @@ import ChipDiagram from '../../components/inf2/ChipDiagram.astro';
 import Diagram from '../../components/inf2/Diagram.astro';
 import T from '../../components/inf2/T.astro';
 import CodeCompare from '../../components/inf2/CodeCompare.astro';
+import ResultsHero from '../../components/inf2/ResultsHero.astro';
 import GlossaryTooltips from '../../components/inf2/GlossaryTooltips.astro';
 import '../../styles/guide.css';
 
@@ -63,6 +64,10 @@ TFLOPS), a <T id="hardware/vector-engine">Vector</T>, a <T id="hardware/scalar-e
 <T id="hardware/gpsimd">GpSimd</T> engine — four instruction streams running in parallel — and a 24 MiB software-managed
 scratchpad, <T id="hardware/sbuf">SBUF</T>. There are no caches: every byte that reaches an engine was moved there by
 a <T id="hardware/dma">DMA</T> you asked for.
+
+The software side has as many names as the hardware — the Neuron Runtime, the neuronx-cc compiler, TorchNeuron, NKI,
+the NKI Library, NxD, vLLM Neuron. [The Neuron software stack](/blog/inf2/programming/neuron-sdk-stack/) explains each
+one and which this port used: TorchNeuron for the PyTorch parts and NKI for the hot path.
 
 On paper the chip has 820 GB/s of memory bandwidth and 190 dense bf16 TFLOPS. I measured 257 GB/s into one core and
 about 508 GB/s with both cores streaming. For comparison, an NVIDIA L4 lists 300 GB/s and 121 dense bf16 TFLOPS.
@@ -567,20 +572,41 @@ writing 16-byte rows. Warm-up was not compiling; it was tracing Python.
 
 ## Results
 
-64 concurrent streaming clients, closed loop (each sends its next request when the previous finishes), 90 s, one
-inf2.xlarge, 0 errors:
+64 concurrent streaming clients on one inf2.xlarge, closed loop (each sends its next request as soon as the previous
+one finishes), 90 s, 0 errors:
 
-| Metric | Value |
-| --- | ---: |
-| Real-time factor per stream (p50) | **0.79** |
-| Aggregate audio throughput | **77.1× real time** |
-| TTFA, steady state (after the first 10 s): p50 / p95 / p99 | **245 / 267 / 279 ms** |
-| TTFA, all requests: p50 / p95 / p99 | 246 / 279 / 669 ms |
-| Requests with a playback stall > 50 ms | 0.9% |
-| Mean engine step per core (budget 80 ms) | 60 ms |
+<ResultsHero />
 
-The p99 over all requests comes from the start-up burst — all 64 clients connecting in the same instant, 32 per core,
-admitted over three steps. That tail is the main thing still on my list (a codec "replay" trick that gives every new
+<VegaChart
+  title="Time to first audio, 64 concurrent streams"
+  spec={{
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    width: "container",
+    height: 230,
+    layer: [
+      { data: { values: [
+          { set: "steady state", p: "p50", ms: 245 }, { set: "steady state", p: "p95", ms: 267 }, { set: "steady state", p: "p99", ms: 279 },
+          { set: "all requests, incl. start-up burst", p: "p50", ms: 246 }, { set: "all requests, incl. start-up burst", p: "p95", ms: 279 }, { set: "all requests, incl. start-up burst", p: "p99", ms: 669 }
+        ] },
+        mark: { type: "bar", cornerRadiusEnd: 4, height: { band: 0.8 } },
+        encoding: {
+          y: { field: "p", type: "nominal", title: null, sort: ["p50", "p95", "p99"] },
+          yOffset: { field: "set", type: "nominal", sort: ["steady state", "all requests, incl. start-up burst"] },
+          x: { field: "ms", type: "quantitative", title: "ms", scale: { domain: [0, 720] } },
+          color: { field: "set", type: "nominal", sort: ["steady state", "all requests, incl. start-up burst"], scale: { range: ["#5146f5", "#c4c0ff"] }, legend: { orient: "bottom", title: null, columns: 2, labelLimit: 260 } }
+        } },
+      { data: { values: [{ x: 500, label: "target 500 ms" }] },
+        layer: [
+          { mark: { type: "rule", color: "#ef4444", strokeDash: [5, 4], strokeWidth: 2 }, encoding: { x: { field: "x", type: "quantitative" } } },
+          { mark: { type: "text", color: "#ef4444", align: "left", dx: 5, y: 6, fontSize: 11 }, encoding: { x: { field: "x", type: "quantitative" }, text: { field: "label" } } }
+        ] }
+    ]
+  }}
+/>
+
+Every steady-state percentile is well under the 500 ms target, and only 0.9% of requests had a playback stall longer
+than 50 ms. The one bar past the line — the p99 over *all* requests — comes from the start-up burst: all 64 clients
+connecting in the same instant, 32 per core, admitted over three steps. That tail is the main thing still on my list (a codec "replay" trick that gives every new
 stream audio one frame sooner is implemented and verified, but not load-tested yet).
 
 Accuracy against the CPU fp32 reference, teacher-forced on golden prompts: the talker's codebook-0 choices match

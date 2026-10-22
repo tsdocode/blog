@@ -1,0 +1,88 @@
+---
+title: The Neuron software stack
+short: SDK map
+summary: "What each piece of the Neuron SDK is — runtime, neuronx-cc, TorchNeuron, NKI, NKI Library, NxD, vLLM Neuron — and which ones this port actually used."
+order: 0
+related: [programming/nki, programming/tracing-and-compilation, programming/profiling]
+---
+import StackDiagram from '../../../components/inf2/StackDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+"Neuron" is the name of AWS's whole software stack for Inferentia and Trainium, the way CUDA is for NVIDIA GPUs —
+and like CUDA it is several layers, each with its own name. Coming from GPUs, the rough mapping is: the **Neuron
+Runtime** is the CUDA driver and runtime, **neuronx-cc** is the compiler (closer to XLA than to nvcc), **TorchNeuron**
+is PyTorch's device backend, **NKI** is the kernel language (closer to Triton than to CUDA C++), and the libraries on top
+play the role of vLLM, TensorRT-LLM or FlashAttention.
+
+<Diagram label="Neuron SDK layers" caption="The Neuron SDK, bottom to top. Highlighted: what the Qwen3-TTS port uses. NKI kernels and compiled graphs both end up as NEFF binaries that the runtime loads.">
+  <StackDiagram />
+</Diagram>
+
+## The layers
+
+| Layer | Component | What it is | GPU analogue |
+| --- | --- | --- | --- |
+| runtime | **Neuron Runtime (`libnrt`) + driver** | Loads compiled binaries (NEFFs), manages device memory, runs them on NeuronCores, coordinates collectives. `NEURON_RT_VISIBLE_CORES` picks the cores a process gets. | CUDA driver + runtime |
+| compiler | **neuronx-cc** | Compiles a graph — XLA HLO, or StableHLO from PyTorch — into a **NEFF**, the executable a NeuronCore runs. NKI kernels are compiled to NEFFs too. | XLA + ptxas |
+| framework | **TorchNeuron** (`torch-neuronx` 2.14) | PyTorch's `neuron` device: change `cuda` to `neuron` and eager ops run on the chip (each op compiled once and cached); `torch.compile(backend="neuron")` compiles whole graphs via StableHLO and neuronx-cc, without TorchInductor. | PyTorch's CUDA backend |
+| framework | **JAX NeuronX** | A PJRT plugin for JAX. | JAX on CUDA |
+| kernels | **NKI** (Neuron Kernel Interface) | A Python-embedded language for writing your own kernels against the NeuronCore's instruction set. | Triton / CUDA C++ |
+| kernels | **NKI Library** | Prebuilt NKI kernels: attention, MLP, MoE, QKV, RMSNorm, RoPE, … | FlashAttention, cuBLAS-style kernel libraries |
+| libraries | **vLLM Neuron** | AWS's recommended LLM serving stack on Trainium. | vLLM on CUDA |
+| libraries | **NxD Core / NxD Inference** | Distributed (tensor-parallel) building blocks and a model hub for inference. | Megatron-style model-parallel libraries |
+| libraries | **optimum-neuron** | Hugging Face's interface between Transformers and Neuron, maintained by Hugging Face. | — |
+| libraries | **transformers-neuronx** | The older LLM inference library for Trn1 / Inf2. | — |
+| tools | **Neuron Explorer**, `neuron-ls`, `neuron-top`, `neuron-monitor` | The profiler (it replaced `neuron-profile` in SDK 2.30) and device / utilisation tools. | Nsight, `nvidia-smi` |
+
+## What changed recently — read this before following an old tutorial
+
+The Neuron stack moved a lot in the last few releases, and much of what you find online describes an older one:
+
+- **PyTorch is now "native".** Older `torch-neuronx` was built on PyTorch/XLA (`torch_neuronx.trace`, lazy XLA
+  tensors). Since the 2.13 / 2.14 releases it is **TorchNeuron**, a regular PyTorch device backend with eager mode and
+  `torch.compile`. The docs call PyTorch 2.9 the last XLA-based version.
+- **Lifecycle in SDK 2.33** (October 2026), per the release notes: TorchNeuron and vLLM Neuron are the recommended
+  paths for new work. NxD Inference and the NxD Core inference APIs are in maintenance mode — support on Trn2/Trn3 ends
+  in 2.34, and on Inf2/Trn1 they stay at SDK 2.31. PyTorch/XLA inference stays in maintenance on Inf2/Trn1.
+  transformers-neuronx reached end of support in 2.26.
+- **Hardware coverage differs per component.** The docs list TorchNeuron as a public beta for Trn2/Trn3; vLLM Neuron's
+  supported models are listed for Trn2/Trn3; several NKI Library kernels are marked Trainium2-only or Trainium3-only.
+
+## What this port used, and why
+
+| Component | Used? | Why |
+| --- | --- | --- |
+| Neuron Runtime | yes | everything runs through it; one process per NeuronCore via `NEURON_RT_VISIBLE_CORES` |
+| neuronx-cc | yes | compiles both the remaining PyTorch glue and every NKI kernel |
+| TorchNeuron 2.14 | yes | the model loading, the engine loop, eager glue ops and a few `torch.compile` graphs (codec pre/post) all run as ordinary PyTorch on the `neuron` device. Officially listed for Trainium; on this inf2.xlarge it worked |
+| NKI 0.7 | **yes — the hot path** | the talker, code predictor and codec kernels (see <T id="programming/nki">NKI</T>) |
+| NKI Library | tried | its MLP kernel failed to compile on this chip generation, and its attention kernels rely on DMA features from Trainium2 onwards — used as reading material for algorithms |
+| vLLM Neuron, NxD Inference, optimum-neuron | no | they serve supported LLM architectures; Qwen3-TTS is three different models per audio frame (talker, code predictor, streaming codec) with its own scheduling, so the serving engine is custom |
+| Neuron Explorer | yes | every profile in this guide (see <T id="programming/profiling">profiling a kernel</T>) |
+
+The progression the docs recommend matches what happened here: start in eager mode, compile graphs with
+`torch.compile`, and write NKI kernels where the compiler leaves performance on the table.
+
+## Versions in this project
+
+From the Neuron DLAMI's PyTorch environment on the inf2.xlarge:
+
+| Package | Version |
+| --- | --- |
+| Neuron SDK | 2.33 |
+| torch | 2.14.0 |
+| torch-neuronx (TorchNeuron) | 2.14.3 |
+| neuronx-cc (package version, not the SDK version) | 2.28 |
+| nki | 0.7.0 |
+
+<InCode file="neuron/setup_env.sh">
+The port's environment is a small venv layered on the DLAMI's torch-neuronx 2.14 environment, plus the upstream
+package and the CPU-side libraries its loader needs.
+</InCode>
+
+Sources: AWS Neuron docs — [overview](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/index.html),
+[PyTorch support](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/torch/index.html),
+[NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html),
+[What's new](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/whats-new.html).

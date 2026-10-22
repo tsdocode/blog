@@ -1,0 +1,63 @@
+---
+// The Neuron SDK, bottom to top. Accent boxes = what the Qwen3-TTS port uses.
+---
+<svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="470" rx="12" />
+  <text class="d-label" x="24" y="30">NEURON SDK 2.33 — BOTTOM TO TOP</text>
+  <rect class="d-accent" x="560" y="16" width="14" height="14" rx="3" />
+  <text class="d-small" x="580" y="28">used by this project</text>
+
+  <!-- libraries -->
+  <text class="d-mono" x="24" y="62">libraries</text>
+  <rect class="d-box" x="110" y="44" width="149" height="66" rx="8" />
+  <text class="d-text" x="122" y="68">vLLM Neuron</text>
+  <text class="d-small" x="122" y="88">LLM serving</text>
+  <rect class="d-box" x="269" y="44" width="149" height="66" rx="8" />
+  <text class="d-text" x="281" y="68">NxD Inference</text>
+  <text class="d-small" x="281" y="88">model hub</text>
+  <text class="d-small" x="281" y="102">(maintenance mode)</text>
+  <rect class="d-box" x="428" y="44" width="149" height="66" rx="8" />
+  <text class="d-text" x="440" y="68">optimum-neuron</text>
+  <text class="d-small" x="440" y="88">Hugging Face</text>
+  <rect class="d-box" x="587" y="44" width="149" height="66" rx="8" />
+  <text class="d-text" x="599" y="68">NKI Library</text>
+  <text class="d-small" x="599" y="88">prebuilt kernels (tried)</text>
+
+  <!-- frameworks -->
+  <text class="d-mono" x="24" y="146">frameworks</text>
+  <rect class="d-accent" x="110" y="122" width="310" height="70" rx="8" />
+  <text class="d-text" x="122" y="148">TorchNeuron (torch-neuronx 2.14)</text>
+  <text class="d-small" x="122" y="168">device "neuron": eager ops + torch.compile</text>
+  <text class="d-small" x="122" y="184">(backend="neuron") → StableHLO → neuronx-cc</text>
+  <rect class="d-box" x="430" y="122" width="130" height="70" rx="8" />
+  <text class="d-text" x="442" y="148">JAX NeuronX</text>
+  <text class="d-small" x="442" y="168">PJRT plugin</text>
+  <rect class="d-accent" x="570" y="122" width="166" height="70" rx="8" />
+  <text class="d-text" x="582" y="148">NKI 0.7</text>
+  <text class="d-small" x="582" y="168">write your own kernels</text>
+  <text class="d-small" x="582" y="184">(called from PyTorch)</text>
+
+  <!-- compiler -->
+  <text class="d-mono" x="24" y="232">compiler</text>
+  <rect class="d-accent" x="110" y="208" width="626" height="62" rx="8" />
+  <text class="d-text" x="122" y="234">neuronx-cc</text>
+  <text class="d-small" x="122" y="254">graphs (HLO / StableHLO) and NKI kernels → NEFF, the binary a NeuronCore runs</text>
+
+  <!-- runtime -->
+  <text class="d-mono" x="24" y="310">runtime</text>
+  <rect class="d-accent" x="110" y="286" width="626" height="62" rx="8" />
+  <text class="d-text" x="122" y="312">Neuron Runtime (libnrt) + kernel driver</text>
+  <text class="d-small" x="122" y="332">loads NEFFs, allocates device memory, runs them on NeuronCores (NEURON_RT_VISIBLE_CORES)</text>
+
+  <!-- hardware -->
+  <text class="d-mono" x="24" y="388">hardware</text>
+  <rect class="d-amber" x="110" y="364" width="626" height="50" rx="8" />
+  <text class="d-text" x="122" y="394">Inferentia2 / Trainium chips — NeuronCores, HBM, DMA</text>
+
+  <!-- tools -->
+  <text class="d-mono" x="24" y="448">tools</text>
+  <rect class="d-accent" x="110" y="428" width="300" height="32" rx="8" />
+  <text class="d-small" x="122" y="449">Neuron Explorer — profiler (capture / view)</text>
+  <rect class="d-box" x="420" y="428" width="316" height="32" rx="8" />
+  <text class="d-small" x="432" y="449">neuron-ls · neuron-top · neuron-monitor</text>
+</svg>

@@ -28,7 +28,7 @@ const terms = GLOSSARY.map((t) => ({ ...t, href: t.link ? `${guideBase()}${t.lin
     const byLength = (a: string, b: string) => b.length - a.length;
     const reExact = new RegExp(`(?<![\\w-])(${exact.sort(byLength).map(esc).join('|')})(?![\\w-])`, 'g');
     const reCi = new RegExp(`(?<![\\w-])(${insensitive.sort(byLength).map(esc).join('|')})(?![\\w-])`, 'gi');
-    const skip = 'pre, code, a, h1, h2, h3, h4, h5, h6, svg, figure, .gl-term, .callout-label, .stat small, .guide-short';
+    const skip = 'pre, code, a, h1, h2, h3, h4, h5, h6, svg, figure, .gl-term, .callout-label, .stat small, .guide-short, .results-hero';
 
     // mark the first occurrence of each term per paragraph-level block (p, li, table cell, callout, …), so every
     // paragraph has its own hover targets without underlining the same word twice in one paragraph
