@@ -3,7 +3,7 @@ title: "Inf2 is so underrated: 64 real-time TTS streams on one Inferentia2 chip"
 description: "I ported a Qwen3-TTS serving engine to AWS Inferentia2 and hand-wrote its hot path in NKI. One inf2.xlarge now streams 64 voices faster than real time, with steady-state p99 time-to-first-audio of 279 ms."
 category: AI, inference, kernels
 date: 2026-10-22
-readTime: 18 min read
+readTime: 22 min read
 tags: [inferentia2, aws-neuron, nki, kernels, tts, qwen3-tts, inference]
 draft: false
 ogImage: inf2-og.svg
@@ -80,22 +80,135 @@ I also measured the hardware instead of trusting the datasheet: a streaming kern
 
 ## Step 1: compile everything, then read the profiles
 
-The first port was plain PyTorch, each component compiled with `torch.compile(backend="neuron")`, 32 streams per core:
+The first port was plain PyTorch, each component compiled with `torch.compile(backend="neuron")`, 32 streams per core,
+timed with `torch.neuron.synchronize()` around the call:
 
-| Component | Compiled | What the profile showed |
-| --- | ---: | --- |
-| Code predictor, 16 steps unrolled | 73.5 ms | 79% of HBM traffic was 320 hidden `scatter`s — in-place `kv_cache[...].copy_()` became a full-buffer scatter (12.2 GB per frame) |
-| Code predictor, one reusable step graph | 32.1 ms | instruction-overhead bound: ~19,000 matmuls per step with only 32 moving columns |
-| Talker decode step | 29.6 ms | ~3× its 10 ms bandwidth floor |
-| Codec decoder, fp32 | 37.5 ms | — |
-| Codec decoder, bf16 | 29.2 ms | only 22% faster, and **24.9 dB** audio — unusable: every SnakeBeta was several passes spilled to HBM (9.8 GB read per chunk), Tensor Engine 16% busy |
-| **Talker + CP + codec** | **99.2 ms** | **over the 80 ms budget** |
+| Component (32 streams) | Compiled |
+| --- | ---: |
+| Talker decode step | 29.6 ms |
+| Code predictor, 16 depth steps | 73.5 ms |
+| Codec decoder (fp32) | 37.5 ms |
 
-Two more findings decided the plan. AWS's NKI-Lib — the library of prebuilt kernels — did not help: its MLP kernel
-failed to compile on this chip generation, and its attention kernels rely on Trainium2-only DMA features. And the
-compiler's problems were not one bottleneck but the same pattern everywhere: thousands of tiny instructions,
-transposes and spills. So: replace each stage with a hand-written <T id="programming/nki">NKI</T> kernel, one at a
-time, each validated before moving on.
+A timer tells you it is too slow. The profiler tells you why.
+
+### The tool: neuron-explorer
+
+The Neuron SDK's profiler runs one compiled graph (a NEFF) on the device and records every instruction on every engine
+and every DMA transfer, then turns the trace into tables:
+
+```bash
+# 1. run the graph on the device, record its 3rd execution
+neuron-explorer capture -n model.neff -s trace.ntff --profile-nth-exec=3
+# 2. trace -> parquet tables (Summary, OpcodeSummary, HloInstruction, ...)
+neuron-explorer view -n model.neff -s trace_exec_3.ntff --ingest-only
+# my wrapper: both steps + a one-screen summary
+python neuron/tools/profile_neff.py model.neff --name cp-whole-b32
+```
+
+The summary's first line is the part I read first, every time:
+
+- **device time** — how long the graph ran on the core;
+- **HBM rd / wr** — bytes read from and written to device memory, and the effective read bandwidth (against the
+  257 GB/s I measured as the ceiling);
+- **engine busy %** — how much of that time the DMA queues and each compute engine were working.
+
+Then the top instructions by time, per engine, with their counts. Here are the three profiles that decided the plan.
+
+### Profile 1 — the code predictor, 16 steps unrolled into one graph
+
+```text
+[cp-whole-b32] device 70337.7 us
+    | HBM rd 9979.57 MB wr 5548.84 MB | eff 142 GB/s read
+    | DMA 88% TensorE 22% VectorE 22% ScalarE 17%            (one line, wrapped)
+    tensor  MATMUL                 n=144806  15578.2 us
+    tensor  LDWEIGHTS              n=141644  12336.3 us
+    scalar  ACTIVATE               n= 42677  11731.1 us
+    vector  COPY                   n= 22048   7319.3 us
+```
+
+**How to read it.** 70 ms on device and **15.5 GB** of HBM traffic — for a model whose weights are about 160 MB per
+depth step, 2.6 GB per frame. Something is moving six times more data than the weights. DMA is 88% busy and every
+compute engine is around 20%: the graph is waiting on data movement, not computing. The summary cannot say *which* op
+moves the data, so the next query groups the `HloInstruction` table (bytes per compiled op) by op type:
+
+```text
+total HBM traffic attributed to ops: 12.72 GB
+op           count   HBM GB   share
+%scatter       320    12.20   95.9%
+%slice         109     0.37    2.9%
+%multiply     1403     0.06    0.5%
+%dot           482     0.03    0.2%
+```
+
+**What it means.** 320 `scatter` ops moved 12.2 GB — 79% of all the traffic. They came from one innocent pattern:
+writing each step's new K/V into the cache in place with `kv_cache[...].copy_(...)`. Inside a compiled graph each such
+write becomes a scatter over the *whole* cache buffer. The fix was a single reusable step
+graph that takes the step index as a tensor and writes with a `torch.where` mask: **73.5 → 32.1 ms**.
+
+### Profile 2 — the code predictor, one reusable step graph
+
+```text
+[cp-step-b32] device 1794.8 us
+    | HBM rd 193.73 MB wr 23.27 MB | eff 108 GB/s read
+    | DMA 66% TensorE 55% VectorE 33% ScalarE 60%            (one line, wrapped)
+    scalar  ACTIVATE               n=  3249   1062.7 us
+    tensor  MATMUL                 n= 19121    978.4 us
+    tensor  LDWEIGHTS              n= 19040    786.1 us
+    vector  TENSOR_SCALAR          n=  1294    358.4 us
+```
+
+**How to read it.** Now each step reads 194 MB — just the weights — so its floor at 257 GB/s is about 0.75 ms. It takes
+1.79 ms. But no engine is saturated: DMA 66%, Tensor 55%, Scalar 60%. When nothing is at 100% and the kernel is still
+slow, look at the **counts**: **19,121 matmuls and 19,040 weight loads in one step**, each streaming only 32 columns
+(one per stream), plus 3,249 Scalar-Engine activations for tiny norm, RoPE and softmax pieces. Each instruction has a
+fixed cost, and there are tens of thousands of them.
+
+**What it means.** The compiler is not doing anything wrong per op; there are just too many small ops. Only a
+hand-written kernel can issue fewer, wider instructions — the fused code-predictor kernel later ran a whole frame in
+12.6 ms.
+
+### Profile 3 — the codec decoder in bf16
+
+```text
+[codec-bf16-b32] device 292669.0 us
+    | HBM rd 9803.68 MB wr 4443.90 MB | eff 33 GB/s read
+    | DMA 25% TensorE 16% VectorE 44% ScalarE 33% GpSimd 40% (one line, wrapped)
+    scalar  ACTIVATE               n=249535  96413.9 us
+    gpsimd  TENSOR_SCALAR_ADDR     n= 21182  71174.5 us
+    tensor  MATMUL                 n=259939  46518.6 us
+    gpsimd  TENSOR_TENSOR          n= 42394  45934.9 us
+    vector  CAST                   n=103131  42957.5 us
+```
+
+**How to read it.** 293 ms for a 12-frame chunk, 14.2 GB of HBM traffic, but DMA only 25% busy and the Tensor Engine
+16% — the matmuls (the convolutions) are not the problem. The time is in element-wise work: 249,535 Scalar-Engine
+activations, GpSimd and Vector ops, 103,131 casts. And the traffic is not weights. Grouping the `DmaPacketAggregated`
+table by its `spill_type` column:
+
+```text
+spill_type   GB
+reload      9.44     # HBM -> SBUF: read back stored intermediates
+save        4.37     # SBUF -> HBM: intermediates that did not fit
+```
+
+**What it means.** 13.8 of the 14.2 GB are **spills**. The codec's SnakeBeta activation, `x + sin²(αx)/β`, runs after
+every convolution at audio sample rate; compiled, it is several separate passes over huge tensors, each intermediate
+written to HBM and read back. The bf16 build was also only 22% faster than fp32 and lost too much quality (24.9 dB SNR).
+The fix had to keep SnakeBeta's intermediates on chip, fused into the convolution that follows — which is what the
+codec kernels do: **9.4 ms per frame-batch at 52.6 dB**.
+
+### And the talker
+
+I did not profile the compiled talker. Its timing was enough: 29.6 ms per step against a floor of about 11 ms (2.82 GB
+of weights at 257 GB/s) — about 3× off.
+
+### Decision
+
+Talker + code predictor + codec came to **99.2 ms against the 80 ms budget**, and the profiles showed the same pattern
+everywhere: data movement and instruction counts, not arithmetic. AWS's NKI-Lib did not help — its MLP kernel failed to
+compile on this chip generation and its attention kernels rely on Trainium2-only DMA features. So: replace each stage
+with a hand-written <T id="programming/nki">NKI</T> kernel, one at a time, each validated before moving on. (How to read
+a kernel's profile is in the guide: [Profiling a kernel](/blog/inf2/programming/profiling/).)
 
 ## Step 2: replace each stage with a kernel
 
