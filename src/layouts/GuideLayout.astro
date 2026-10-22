@@ -1,5 +1,6 @@
 ---
 import BaseLayout from './BaseLayout.astro';
+import GlossaryTooltips from '../components/inf2/GlossaryTooltips.astro';
 import '../styles/guide.css';
 import { getGuideTree, entryHref, guideBase, SECTIONS } from '../lib/guide';
 
@@ -80,4 +81,5 @@ const home = guideBase();
       </nav>
     </article>
   </div>
+  <GlossaryTooltips />
 </BaseLayout>

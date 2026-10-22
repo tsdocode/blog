@@ -1,0 +1,18 @@
+---
+// Side-by-side code comparison: <div slot="before"> on the left, <div slot="after"> on the right; stacked on phones.
+interface Props {
+  before?: string;
+  after?: string;
+}
+const { before = 'Before', after = 'After' } = Astro.props;
+---
+<div class="code-compare">
+  <div class="code-compare-col code-compare-before">
+    <span class="code-compare-label mono">{before}</span>
+    <slot name="before" />
+  </div>
+  <div class="code-compare-col code-compare-after">
+    <span class="code-compare-label mono">{after}</span>
+    <slot name="after" />
+  </div>
+</div>

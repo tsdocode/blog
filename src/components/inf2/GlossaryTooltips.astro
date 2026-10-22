@@ -1,0 +1,129 @@
+---
+// Marks glossary terms in .article-body text (not code, headings or links) with a dotted underline; hover, focus or
+// tap shows a small popup with the definition and, when there is one, a link to the field-guide entry.
+import { GLOSSARY } from '../../lib/glossary';
+import { guideBase } from '../../lib/guide';
+
+const terms = GLOSSARY.map((t) => ({ ...t, href: t.link ? `${guideBase()}${t.link}/` : undefined }));
+---
+<div class="gl-pop" role="tooltip" hidden></div>
+<script is:inline type="application/json" id="gl-data" set:html={JSON.stringify(terms)}></script>
+<script>
+  type Term = { match: string[]; title: string; def: string; href?: string; ci?: boolean };
+  const terms: Term[] = JSON.parse(document.getElementById('gl-data')?.textContent ?? '[]');
+  const pop = document.querySelector<HTMLElement>('.gl-pop');
+  const body = document.querySelector<HTMLElement>('.article-body');
+
+  if (pop && body && terms.length) {
+    const lookup = new Map<string, Term>();
+    const exact: string[] = [];
+    const insensitive: string[] = [];
+    for (const t of terms) {
+      for (const m of t.match) {
+        lookup.set(t.ci ? m.toLowerCase() : m, t);
+        (t.ci ? insensitive : exact).push(m);
+      }
+    }
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const byLength = (a: string, b: string) => b.length - a.length;
+    const reExact = new RegExp(`(?<![\\w-])(${exact.sort(byLength).map(esc).join('|')})(?![\\w-])`, 'g');
+    const reCi = new RegExp(`(?<![\\w-])(${insensitive.sort(byLength).map(esc).join('|')})(?![\\w-])`, 'gi');
+    const skip = 'pre, code, a, h1, h2, h3, h4, h5, h6, svg, figure, .gl-term, .callout-label, .stat small, .guide-short';
+
+    // walk text in document order; marking restarts at every h2, so each term is marked once per section
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+      acceptNode: (n) => {
+        if (n.nodeType === Node.ELEMENT_NODE) return (n as Element).tagName === 'H2' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+        return n.parentElement?.closest(skip) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes: (Text | 'section')[] = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode.nodeType === Node.ELEMENT_NODE ? 'section' : (walker.currentNode as Text));
+    let seen = new Set<Term>();
+
+    for (const node of nodes) {
+      if (node === 'section') { seen = new Set(); continue; }
+      const text = node.data;
+      const hits: { start: number; end: number; term: Term }[] = [];
+      for (const [re, ci] of [[reExact, false], [reCi, true]] as const) {
+        re.lastIndex = 0;
+        for (let m; (m = re.exec(text)); ) {
+          const term = lookup.get(ci ? m[1].toLowerCase() : m[1]);
+          if (term && !seen.has(term) && !hits.some((h) => h.term === term || (m!.index < h.end && m!.index + m![1].length > h.start))) {
+            hits.push({ start: m.index, end: m.index + m[1].length, term });
+          }
+        }
+      }
+      if (!hits.length) continue;
+      hits.sort((a, b) => a.start - b.start);
+      hits.forEach((h) => seen.add(h.term));
+      const frag = document.createDocumentFragment();
+      let pos = 0;
+      for (const h of hits) {
+        frag.append(text.slice(pos, h.start));
+        const span = document.createElement('span');
+        span.className = 'gl-term';
+        span.tabIndex = 0;
+        span.textContent = text.slice(h.start, h.end);
+        span.dataset.term = String(terms.indexOf(h.term));
+        frag.append(span);
+        pos = h.end;
+      }
+      frag.append(text.slice(pos));
+      node.replaceWith(frag);
+    }
+
+    let hideTimer = 0;
+    let pinned = false;                                  // opened by a tap/click: stays until a tap elsewhere
+    const here = location.pathname.replace(/\/?$/, '/');
+    const show = (el: HTMLElement) => {
+      const t = terms[Number(el.dataset.term)];
+      if (!t) return;
+      window.clearTimeout(hideTimer);
+      pop.innerHTML = '';
+      const title = document.createElement('strong');
+      title.textContent = t.title;
+      const def = document.createElement('span');
+      def.textContent = t.def;
+      pop.append(title, def);
+      if (t.href && t.href !== here) {
+        const link = document.createElement('a');
+        link.href = t.href;
+        link.textContent = 'Read more in the field guide →';
+        pop.append(link);
+      }
+      pop.hidden = false;
+      const r = el.getBoundingClientRect();
+      const w = Math.min(320, window.innerWidth - 24);
+      pop.style.width = `${w}px`;
+      const left = Math.max(12, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 12));
+      const below = r.top < pop.offsetHeight + 16;
+      pop.style.left = `${left + window.scrollX}px`;
+      pop.style.top = `${(below ? r.bottom + 8 : r.top - pop.offsetHeight - 8) + window.scrollY}px`;
+    };
+    const hide = () => { if (!pinned) hideTimer = window.setTimeout(() => { pop.hidden = true; }, 150); };
+
+    body.addEventListener('mouseover', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('.gl-term');
+      if (el && !pinned) show(el);
+    });
+    body.addEventListener('mouseout', (e) => {
+      if ((e.target as HTMLElement).closest('.gl-term')) hide();
+    });
+    body.addEventListener('focusin', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('.gl-term');
+      if (el) show(el);
+    });
+    body.addEventListener('focusout', hide);
+    body.addEventListener('click', (e) => {              // touch screens: tap to open
+      const el = (e.target as HTMLElement).closest<HTMLElement>('.gl-term');
+      if (el) { e.preventDefault(); pinned = true; show(el); }
+    });
+    pop.addEventListener('mouseenter', () => window.clearTimeout(hideTimer));
+    pop.addEventListener('mouseleave', hide);
+    document.addEventListener('click', (e) => {
+      if (!(e.target as HTMLElement).closest('.gl-term, .gl-pop')) { pinned = false; pop.hidden = true; }
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { pinned = false; pop.hidden = true; } });
+  }
+</script>

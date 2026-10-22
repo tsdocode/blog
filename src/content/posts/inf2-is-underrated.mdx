@@ -14,6 +14,8 @@ import VegaChart from '../../components/VegaChart.astro';
 import ChipDiagram from '../../components/inf2/ChipDiagram.astro';
 import Diagram from '../../components/inf2/Diagram.astro';
 import T from '../../components/inf2/T.astro';
+import CodeCompare from '../../components/inf2/CodeCompare.astro';
+import GlossaryTooltips from '../../components/inf2/GlossaryTooltips.astro';
 import '../../styles/guide.css';
 
 Ask people what to serve a speech model on and you will hear "a GPU". Almost nobody says Inferentia2 — AWS's
@@ -141,38 +143,53 @@ op           count   HBM GB   share
 ```
 
 **What it means.** 320 `scatter` ops moved 12.2 GB — 79% of all the traffic. They came from one innocent pattern in the
-upstream model code: on non-CUDA devices, each depth step writes its new K and V into the cache **in place**
-(`src/nari_qwen3_tts/model/components.py`):
+upstream model code: on non-CUDA devices, each depth step writes its new K and V into the cache **in place** (left).
+The fix is on the right:
+
+<CodeCompare before="Before · upstream components.py" after="After · neuron/proto/cp_step_graph.py">
+<div slot="before">
 
 ```python
-# before: one in-place slice write per layer, per depth step (unrolled 16x into one graph)
-kv_cache[layer_index, :, 0, cache_pos:valid_length].copy_(key)
-kv_cache[layer_index, :, 1, cache_pos:valid_length].copy_(value)
-all_keys = kv_cache[layer_index, :, 0, :valid_length].transpose(1, 2)
+# one in-place slice write per layer, per depth
+# step (unrolled 16x into one graph)
+kv_cache[layer_index, :, 0,
+         cache_pos:valid_length].copy_(key)
+kv_cache[layer_index, :, 1,
+         cache_pos:valid_length].copy_(value)
+all_keys = kv_cache[layer_index, :, 0,
+                    :valid_length].transpose(1, 2)
 ```
+
+</div>
+<div slot="after">
+
+```python
+# one reusable step graph; step is a tensor input
+# GROUPS = 16: which slot this step writes,
+# and which slots attention may read
+slot = (torch.arange(GROUPS, device=x.device)
+        == step).view(1, GROUPS, 1, 1)
+visible = (torch.arange(GROUPS, device=x.device)
+           <= step).view(1, 1, 1, GROUPS)
+...
+# new cache = old cache with this slot replaced
+kl = torch.where(slot, k.unsqueeze(1), kv[li, :, 0])
+vl = torch.where(slot, v.unsqueeze(1), kv[li, :, 1])
+# returned as an output, never written in place
+new_kv.append(torch.stack((kl, vl), 1))
+```
+
+</div>
+</CodeCompare>
 
 A compiled graph is functional — it cannot update one slot of a buffer in place — so each `copy_` became a `scatter`
 that produced a whole new cache. The numbers agree: 12.2 GB / 320 ≈ 38 MB per scatter, while the entire cache is
 about 21 MB (5 layers × 32 streams × K/V × 16 slots × 8 heads × 128 × 2 bytes) — every write read and rewrote
 essentially all of it.
 
-The fix (`neuron/proto/cp_step_graph.py`): compile **one** depth step instead of 16, take the step index as a tensor
-input so the same graph is reused for every step, and write the new slot with a mask instead of an in-place slice:
-
-```python
-# after: one reusable step graph; the step index is a tensor input
-# which cache slot this step writes, and which slots attention may read
-slot = (torch.arange(GROUPS, device=x.device) == step).view(1, GROUPS, 1, 1)    # GROUPS = 16
-visible = (torch.arange(GROUPS, device=x.device) <= step).view(1, 1, 1, GROUPS)
-...
-# new cache = old cache with this step's slot replaced
-kl = torch.where(slot, k.unsqueeze(1), kv[li, :, 0])
-vl = torch.where(slot, v.unsqueeze(1), kv[li, :, 1])
-new_kv.append(torch.stack((kl, vl), 1))   # returned as an output, never written in place
-```
-
-`torch.where` is an ordinary element-wise op the compiler streams through once, and the graph returns the new cache
-instead of mutating its input. Compile time dropped from 567 s to 26 s and the frame from **73.5 to 32.1 ms** — which
+The fix compiles **one** depth step instead of 16, takes the step index as a tensor input so the same graph is reused
+for every step, and writes the new slot with a mask instead of an in-place slice. `torch.where` is an ordinary
+element-wise op the compiler streams through once, and the graph returns the new cache instead of mutating its input. Compile time dropped from 567 s to 26 s and the frame from **73.5 to 32.1 ms** — which
 made the next bottleneck visible.
 
 ### Profile 2 — the code predictor, one reusable step graph
@@ -591,3 +608,5 @@ with numbers from the same load test, on the same software, rather than quoted.
 - [nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts) by Nari Labs — the serving engine this port is
   based on.
 - The [Inferentia2 Field Guide](/blog/inf2/) — the chip, NKI, the kernel patterns and every gotcha, one page each.
+
+<GlossaryTooltips />

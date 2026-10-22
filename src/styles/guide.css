@@ -92,3 +92,25 @@ details[open] > .guide-group-title::before { content: '- '; }
   .guide-nav-mobile .guide-group-title { padding-top: 12px; }
   .guide-nav-mobile .guide-group-title::before { content: ''; }
 }
+
+/* side-by-side before / after code (CodeCompare) */
+.code-compare { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 26px 0 30px; }
+.code-compare-col { min-width: 0; display: flex; flex-direction: column; }
+.code-compare-col > div { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.code-compare-label { display: block; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 8px; }
+.code-compare-before .code-compare-label { color: #ef4444; }
+.code-compare-after .code-compare-label { color: #10b981; }
+.article-body .code-compare pre.astro-code { margin: 0; flex: 1; padding: 16px 14px; font-size: 11px; }
+.article-body .code-compare-before pre.astro-code { border-top: 3px solid #ef4444; }
+.article-body .code-compare-after pre.astro-code { border-top: 3px solid #10b981; }
+@media (max-width: 760px) { .code-compare { grid-template-columns: minmax(0, 1fr); } }
+
+/* glossary tooltips (GlossaryTooltips.astro) */
+.gl-term { text-decoration: underline dotted color-mix(in srgb, var(--accent) 70%, transparent); text-decoration-thickness: 1.5px; text-underline-offset: 4px; cursor: help; border-radius: 3px; outline: none; }
+.gl-term:hover, .gl-term:focus-visible { background: var(--accent-soft); }
+.gl-pop { position: absolute; z-index: 50; display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--text); box-shadow: 0 12px 32px rgba(15, 20, 40, .18); font: 13px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; letter-spacing: 0; }
+.gl-pop[hidden] { display: none; }
+.gl-pop strong { font-size: 13px; letter-spacing: -.01em; }
+.gl-pop span { color: var(--muted); }
+.gl-pop a { color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; }
+.gl-pop a:hover { text-decoration: underline; }
