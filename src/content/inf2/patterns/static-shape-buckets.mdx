@@ -19,8 +19,8 @@ few static shapes, with each step padded up to the smallest one that fits.
 2. **Bucket what you cannot.** Two dimensions vary: context length (pages per stream) and how many new prompts
    arrive. Our talker uses 4 page buckets × 4 prefill buckets = **16 variants**.
 3. **Mind the padding cost.** A padded page still costs its matmuls. With the smallest page bucket at 2 pages, half
-   of all decode attention ran on empty pages for short utterances (contexts under 128 tokens) — hence a 1-page
-   bucket, estimated to save about 4 ms a step.
+   of all decode attention ran on empty pages for short utterances (contexts under 128 tokens). Adding a 1-page bucket
+   took the talker step for 32 such streams from 18.8 to 16.5 ms.
 4. **Mind hardware thresholds.** Prefill buckets of 1 / 2 / 3 tiles (≤ 416 tokens) keep the whole step under 512
    tokens; 4 tiles (544) made every weight block run a second, 32-token matmul.
 5. **Compile them all at startup**, plus an end-to-end pass that exercises the eager ops around them.
