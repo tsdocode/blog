@@ -1,0 +1,63 @@
+---
+title: Fused talker step
+short: talker_step
+summary: All 28 transformer layers of Qwen3-TTS's talker in one kernel launch, for a mixed batch of decode tokens and packed new prompts.
+order: 1
+related: [kernels/paged-kv-attention, kernels/packed-prefill, patterns/weight-tiling]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Qwen3-TTS generates speech in three stages per 80 ms audio frame. The first is the **talker**: a 28-layer,
+1.4 B-parameter transformer (hidden 2048, 16 query / 8 KV heads of 128, MLP 6144) that predicts the first codebook
+token of the next frame. In a serving engine with 32 streams per core, one talker step is one decode token per
+stream — plus any new prompts that arrive.
+
+<Stats items={[
+  { value: '1', label: 'kernel launch for all 28 layers', note: 'TTS engine' },
+  { value: '11.0 ms', label: 'dense part, 32 streams (247 GB/s)', note: 'measured' },
+  { value: '18.8 ms', label: 'full step, 32 streams, context < 256', note: 'measured' },
+  { value: '29.6 ms', label: 'compiled-graph baseline (decode only)', note: 'measured' }
+]} />
+
+## One launch, mixed batch
+
+The kernel takes all of this step's tokens as one transposed activation `xT [2048, T]`:
+
+- **32 decode rows**, one per slot (empty slots are padding), attending to their paged KV cache —
+  <T id="kernels/paged-kv-attention">paged KV attention</T>.
+- **0–3 tiles of 128 packed prompt tokens**, attending within their own prompt —
+  <T id="kernels/packed-prefill">varlen packed prefill</T>.
+
+Every layer runs RMSNorm → fused QKV projection → per-head norm + RoPE (<T id="patterns/qk-norm-rope">as matmuls</T>)
+→ KV-cache write → attention for each token group → output projection → residual → RMSNorm → fused SwiGLU MLP →
+residual. Activations stay in SBUF across all 28 layers; the 2.82 GB of weights stream through, block by block.
+
+## Where the time goes
+
+| Part | Time (32 decode streams) | Notes |
+| --- | ---: | --- |
+| Dense: projections + MLP | 11.0 ms | 2.82 GB at 247 GB/s — at the HBM ceiling |
+| Attention + KV write | ~8 ms | many tiny matmuls; ~3× its byte floor |
+| + 3 tiles of new prompts | +20 ms | compute-bound: ~1.1 TFLOP of prefill |
+
+The dense part is done: it is limited by HBM bandwidth, and only fewer weight bytes (FP8) would make it faster. The
+attention is the remaining inefficiency — see <T id="performance/matmul-cost">the matmul cost model</T>.
+
+## Design choices that mattered
+
+- **Weights as the stationary operand, tokens moving.** With ≤ 512 tokens, every weight tile is loaded once per
+  step and all tokens stream through it.
+- **Token-chunked linears.** Above 512 tokens a moving tile no longer fits one PSUM bank, and the activations no longer
+  fit SBUF with everything else. Linears and SwiGLU process tokens in chunks of 512 — but keep a whole step at or
+  below 512 tokens anyway, or every weight block runs a second, short matmul (see
+  <T id="patterns/static-shape-buckets">buckets</T>).
+- **SwiGLU straight out of PSUM.** Gate and up are interleaved in the weight tiling so `silu(gate) · up` is computed
+  during the eviction; the 12,288-wide intermediate is never materialised.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+`talker_step(xT, cos, sin, ...weights, k_cache, v_cache, rows_hbm, offs0, mask0, offs1, mask1, groups=...)` — the
+`groups` tuple is static, e.g. `((32, 1, 2), (3, 128, 0))`: 32 decode segments of 1 query with 2 pages each, plus 3
+packed prefill tiles.
+</InCode>

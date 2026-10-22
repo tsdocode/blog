@@ -1,0 +1,38 @@
+---
+title: Static shape buckets
+short: buckets
+summary: Every distinct shape is a separate compiled kernel. Pick a small set of buckets, pad to them, and compile them all before serving.
+order: 6
+related: [programming/tracing-and-compilation, engine/lockstep-batching]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Serving traffic is dynamic: streams join and leave, contexts grow, prompts have different lengths. NKI kernels are
+static (see <T id="programming/tracing-and-compilation">tracing and compilation</T>). The bridge is **buckets**: a
+few static shapes, with each step padded up to the smallest one that fits.
+
+## Designing the buckets
+
+1. **Fix what you can.** The talker step always has 32 decode rows, one per slot; empty slots are padding with no
+   visible keys. That removes the batch size from the shape entirely.
+2. **Bucket what you cannot.** Two dimensions vary: context length (pages per stream) and how many new prompts
+   arrive. Our talker uses 4 page buckets × 4 prefill buckets = **16 variants**.
+3. **Mind the padding cost.** A padded page still costs its matmuls. With the smallest page bucket at 2 pages, half
+   of all decode attention ran on empty pages for short utterances (contexts under 128 tokens) — hence a 1-page
+   bucket, estimated to save about 4 ms a step.
+4. **Mind hardware thresholds.** Prefill buckets of 1 / 2 / 3 tiles (≤ 416 tokens) keep the whole step under 512
+   tokens; 4 tiles (544) made every weight block run a second, 32-token matmul.
+5. **Compile them all at startup**, plus an end-to-end pass that exercises the eager ops around them.
+
+| Dimension | Buckets | Why |
+| --- | --- | --- |
+| decode rows | 32 (fixed) | one per slot; padding rows fully masked |
+| pages per stream | 1, 2, 4, 8 | 128 / 256 / 512 / 1024 tokens of context |
+| prefill tiles | 0, 1, 2, 3 | 128-token tiles of packed prompts; T ≤ 512 |
+| codec frames per call | 2 | chunked codec every 2 steps |
+
+<InCode file="neuron/engine/neuron_engine.py">
+`PPS_BUCKETS = (1, 2, 4, 8)` and `PREFILL_TILE_BUCKETS = (1, 2, 3)`; `warmup()` compiles every combination, then runs
+bursts of 1–20 real requests so the eager ops compile too.
+</InCode>

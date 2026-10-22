@@ -1,0 +1,203 @@
+---
+title: "Inf2 is so underrated: 64 real-time TTS streams on one Inferentia2 chip"
+description: "I ported a Qwen3-TTS serving engine to AWS Inferentia2 and hand-wrote its hot path in NKI. One inf2.xlarge now streams 64 voices faster than real time, with steady-state p99 time-to-first-audio of 279 ms."
+category: AI, inference, kernels
+date: 2026-10-22
+readTime: 14 min read
+tags: [inferentia2, aws-neuron, nki, kernels, tts, qwen3-tts, inference]
+draft: false
+ogImage: inf2-og.svg
+---
+
+import Mermaid from '../../components/Mermaid.astro';
+import VegaChart from '../../components/VegaChart.astro';
+import ChipDiagram from '../../components/inf2/ChipDiagram.astro';
+import Diagram from '../../components/inf2/Diagram.astro';
+import T from '../../components/inf2/T.astro';
+import '../../styles/guide.css';
+
+Ask people what to serve a speech model on and you will hear "a GPU". Almost nobody says Inferentia2 — AWS's
+inference chip, sitting in an instance that costs about the same as a single small GPU.
+
+I spent a few days finding out what it can actually do. I took
+[nari-labs/nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts), a high-throughput serving engine for
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) built for an H100, and ported it to one **inf2.xlarge**, writing the
+hot path as hand-tuned kernels in AWS's kernel language, NKI.
+
+The result: **64 concurrent streaming voices on one chip, each generated faster than real time** (real-time factor
+0.79), **77× real time in aggregate**, and a steady-state p99 time to first audio of **279 ms**.
+
+This post is the story and the lessons. Alongside it I wrote an
+[**Inferentia2 Field Guide**](/blog/inf2/) — short, cross-linked pages that explain the chip one component at a time,
+because almost nothing like it exists. Links in this post jump into it.
+
+## The workload: three models per 80 ms
+
+Qwen3-TTS (the 1.7B CustomVoice model) produces speech as codec frames: 12.5 frames per second, each frame 16
+codebook tokens, each frame 80 ms of 24 kHz audio. Making one frame takes three models in sequence:
+
+<Mermaid
+title="One Qwen3-TTS frame"
+chart={`flowchart LR
+  T["Talker<br/>28 layers, 1.4B<br/>codebook 0"] --> C["Code predictor<br/>5 layers × 16 steps<br/>codebooks 1-15"]
+  C --> D["Codec decoder<br/>transformer + convs<br/>1,920 samples"]
+  D --> A["80 ms of audio"]
+`} />
+
+For a server, the constraint is brutal and simple: **every stream needs a new frame every 80 ms**. If one engine step
+serves 32 streams and produces one frame for each, the whole step — talker, code predictor and codec for all 32 —
+must take less than 80 ms, or playback stalls.
+
+## The chip, in one picture
+
+<Diagram label="Inferentia2 chip" caption="One Inferentia2: two NeuronCore-v2 sharing 32 GiB of HBM. Each core is a full accelerator with four engines and its own on-chip memory.">
+  <ChipDiagram />
+</Diagram>
+
+An Inferentia2 chip is two independent <T id="hardware/neuroncore-v2">NeuronCores</T> sharing 32 GiB of
+<T id="hardware/hbm">HBM</T>. Each core has a 128 × 128 <T id="hardware/tensor-engine">Tensor Engine</T> (≈ 92 bf16
+TFLOPS), a <T id="hardware/vector-engine">Vector</T>, a <T id="hardware/scalar-engine">Scalar</T> and a
+<T id="hardware/gpsimd">GpSimd</T> engine — four instruction streams running in parallel — and a 24 MiB software-managed
+scratchpad, <T id="hardware/sbuf">SBUF</T>. There are no caches: every byte that reaches an engine was moved there by
+a <T id="hardware/dma">DMA</T> you asked for.
+
+On paper the chip has 820 GB/s of memory bandwidth and 190 dense bf16 TFLOPS. I measured 257 GB/s into one core and
+about 508 GB/s with both cores streaming. For comparison, an NVIDIA L4 lists 300 GB/s and 121 dense bf16 TFLOPS.
+
+## Why I had to write kernels
+
+The first port used the Neuron compiler on the PyTorch graphs. Per 32 streams it needed:
+
+| Stage | Compiled graphs |
+| --- | ---: |
+| Talker step | 29.6 ms |
+| Code predictor, 16 steps | 32.1 ms |
+| Codec decoder (fp32) | 37.5 ms |
+| **Total** | **99.2 ms — over the 80 ms budget** |
+
+The profiles showed why: tens of thousands of tiny instructions per step, thousands of transposes, intermediate
+tensors spilling to HBM between ops. A transformer graph compiles well; a serving loop with paged attention, sampling
+and a streaming audio codec does not. So the hot path became <T id="programming/nki">NKI</T> kernels: Python functions
+in which you place every tile in on-chip memory and issue every engine instruction yourself. The guide has
+[a 60-line first kernel](/blog/inf2/programming/first-kernel/) explained line by line.
+
+## The journey
+
+<VegaChart
+  title="64-stream load test: real-time factor per stream"
+  spec={{
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    width: "container",
+    height: 280,
+    layer: [
+      { data: { values: [
+          { step: "1. one process", rtf: 1.19 },
+          { step: "2. process per core", rtf: 1.09 },
+          { step: "3. DMA fix + cp_frame", rtf: 0.88 },
+          { step: "4. varlen prefill", rtf: 0.79 }
+        ] },
+        mark: { type: "bar", color: "#5146f5", cornerRadiusEnd: 4 },
+        encoding: {
+          y: { field: "step", type: "nominal", sort: null, title: null, axis: { labelLimit: 140 } },
+          x: { field: "rtf", type: "quantitative", title: "real-time factor (1.0 = real time)", scale: { domain: [0, 1.3] } }
+        } },
+      { data: { values: [{ x: 1 }] }, mark: { type: "rule", color: "#ef4444", strokeDash: [5, 4], strokeWidth: 2 },
+        encoding: { x: { field: "x", type: "quantitative" } } }
+    ]
+  }}
+/>
+
+Before the first load test came the kernels: a fused 28-layer <T id="kernels/talker-step">talker step</T>
+with <T id="kernels/paged-kv-attention">paged KV attention</T>, a fused code-predictor step, the codec's
+<T id="kernels/codec-convs">SnakeBeta convolutions</T> and its <T id="kernels/codec-front-transformer">front transformer</T>.
+That got one core to real time with 32 streams. Getting **both cores** to real time — 64 streams — took four more steps:
+
+1. **Two engines, one process (RTF 1.19).** The kernels were fast enough, but each step also has ~10 ms of Python,
+   and two engines in one interpreter fought over the GIL.
+2. **One process per core (1.09).** Two server processes behind a tiny streaming router — see
+   <T id="engine/per-core-processes">one process per NeuronCore</T>.
+3. **A DMA bug and a one-launch code predictor (0.88).** The codec's front transformer was spending 12 ms moving its
+   attention state in 140-byte DMA descriptors; fixing the layout took it to 3.3 ms. The code predictor's 16 depth
+   steps plus sampling became [a single kernel launch](/blog/inf2/kernels/cp-frame/) with top-50 sampling on chip.
+4. **Varlen prefill and host fixes (0.79).** New prompts are packed back to back into 128-token tiles with a
+   block-diagonal causal mask — the FlashAttention-varlen idea, on a NeuronCore
+   ([packed prefill](/blog/inf2/kernels/packed-prefill/)) — and the host's Python was vectorised.
+
+## Five lessons that only bite on Inferentia
+
+**1. Count instructions, not FLOPs.** A matmul with 2 moving columns costs about the same as one with 128 — roughly
+130 ns either way in my kernels — and one with 512 columns does 256× the work for 2.6× the time. Decode attention,
+with one query per stream, issues ~78,000 tiny matmuls per step and is now the slowest part of the talker.
+→ [The matmul cost model](/blog/inf2/performance/matmul-cost/)
+
+**2. A DMA costs its descriptors, not its bytes.** The same 37 MB of state moved at 13 GB/s or near full speed
+depending only on whether each partition's destination was contiguous.
+→ [DMA engines and descriptors](/blog/inf2/hardware/dma/)
+
+**3. Stay at or below 512 tokens per step.** A matmul's moving tile fits one 512-column PSUM bank. At 544 tokens every
+weight block ran a full matmul *plus* a 32-column one — 86,000 extra instructions, ~11 ms.
+→ [Static shape buckets](/blog/inf2/patterns/static-shape-buckets/)
+
+**4. Padding is not free.** A padded KV page or a padded prompt token costs exactly as much as a real one. Packing
+prompts instead of padding them to 64 tokens made a prefill step 1.7× cheaper per prompt.
+→ [Varlen packed prefill](/blog/inf2/kernels/packed-prefill/)
+
+**5. Your 15-minute cold start is probably Python.** Warm-up took 925 s per core with every binary already cached:
+each process re-traced every kernel variant just to compute its cache key. NKI's trace cache loads a variant in 1 s.
+→ [Cold start and the trace cache](/blog/inf2/engine/cold-start-trace-cache/)
+
+## Results
+
+64 concurrent streaming clients, closed loop (each sends its next request when the previous finishes), 90 s, one
+inf2.xlarge, 0 errors:
+
+| Metric | Value |
+| --- | ---: |
+| Real-time factor per stream (p50) | **0.79** |
+| Aggregate audio throughput | **77.1× real time** |
+| TTFA, steady state (after the first 10 s): p50 / p95 / p99 | **245 / 267 / 279 ms** |
+| TTFA, all requests: p50 / p95 / p99 | 246 / 279 / 669 ms |
+| Requests with a playback stall > 50 ms | 0.9% |
+| Mean engine step per core (budget 80 ms) | 60 ms |
+
+The p99 over all requests comes from the start-up burst — all 64 clients connecting in the same instant, 32 per core,
+admitted over three steps. That tail is the main thing still on my list (a codec "replay" trick that gives every new
+stream audio one frame sooner is implemented and verified, but not load-tested yet).
+
+Accuracy against the CPU fp32 reference, teacher-forced on golden prompts: the talker's codebook-0 choices match
+95–100%, the code predictor's 96–97%, end of speech lands on the golden frame, and the streamed audio matches a
+whole-sequence fp32 decode of the same codes at 46–48 dB SNR.
+
+## What it costs
+
+On-demand prices from instances.vantage.sh (us-east-1, Linux) on October 22, 2026:
+
+| | inf2.xlarge (1 Inferentia2) | g6.xlarge (1 NVIDIA L4) |
+| --- | ---: | ---: |
+| On-demand | $0.758 / h | $0.805 / h |
+| 1-year reserved | $0.478 / h | $0.524 / h |
+| Concurrent real-time streams | **64** (measured, RTF 0.79) | TBU — I will run the same load test on an L4 |
+| On-demand cost per concurrent stream-hour | **$0.0118** | TBU |
+| Audio hours generated per instance-hour | **77.1** | TBU |
+| On-demand cost per hour of generated audio | **$0.0098** | TBU |
+
+I set out to match an internal L4 result: 64 concurrent streams with TTFA under 500 ms. The L4 column will be filled in
+with numbers from the same load test, on the same software, rather than quoted.
+
+## What is next
+
+- **Decode attention.** About 8 ms of the talker step against a ~3 ms byte floor: fewer, wider matmuls (P·V for all
+  16 heads of a page in two 512-column matmuls) instead of three tiny ones per page and head.
+- **The start-up burst.** Load-test the first-audio replay; admit bursts faster.
+- **The codec glue.** About 3.5 ms per call is still compiled PyTorch.
+- **FP8 weights** for the bandwidth-bound decode path — if the quality holds.
+
+## Code and credits
+
+- The port: [tsdocode/aws-inf2-qwen3-tts](https://github.com/tsdocode/aws-inf2-qwen3-tts) — kernels, engine, tests,
+  benchmarks and the full engineering log.
+- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by the Qwen team
+  ([technical report](https://arxiv.org/abs/2601.15621)).
+- [nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts) by Nari Labs — the serving engine this port is
+  based on.
+- The [Inferentia2 Field Guide](/blog/inf2/) — the chip, NKI, the kernel patterns and every gotcha, one page each.

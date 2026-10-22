@@ -1,0 +1,55 @@
+---
+title: Cold start and the trace cache
+short: 15 min → minutes
+summary: Server warm-up took ~15 minutes per core even with every binary cached — the time went into re-tracing kernels in Python, not compiling.
+order: 4
+related: [programming/tracing-and-compilation, patterns/static-shape-buckets]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Before serving, the engine warms up every kernel variant (16 talker variants, the code predictor, the codec) so no
+shape compiles under traffic. That took **925 s on one core** — even though every compiled binary was already in the
+cache and no new NEFF had been written for hours.
+
+<Stats items={[
+  { value: '925 s', label: 'warm-up of one core, all NEFFs cached', note: 'measured' },
+  { value: '~110 s', label: 'per talker variant: trace + lowering, before the cache lookup', note: 'measured' },
+  { value: '1 s', label: 'same variant with the NKI trace cache', note: 'measured' },
+  { value: '1.5–3 min', label: 'expected warm-up per core with a warm cache', note: 'estimate' }
+]} />
+
+## Where the time went
+
+A Python profile of one variant's first call:
+
+```text
+compiled.py:389(get_cache_key)        112.5 s
+  driver.py:79(_trace)                 98.9 s     # run the kernel body symbolically
+  ncc_driver.py:compile_mlir_to_bir    13.6 s     # lower it
+```
+
+The NEFF cache key is computed from the traced and lowered kernel, so a fresh process re-traces every variant just to
+look up a binary that already exists. A 28-layer kernel unrolled with `static_range` is tens of thousands of
+instructions of Python tracing.
+
+## The fix
+
+NKI has a persistent trace cache that stores the traced kernel as well:
+
+```bash
+KHASH=$(cat neuron/kernels/*.py | sha1sum | cut -c1-12)
+export NKI_ENABLE_TRACE_CACHE=1
+export NKI_TRACE_CACHE_ROOTS="$PWD/neuron/kernels"          # fingerprint our kernel sources
+export NKI_TRACE_CACHE_URL="$HOME/.cache/qtts-neuron/nki-trace/$KHASH"
+export TORCH_NEURONX_NEFF_CACHE_DIR="$HOME/.cache/qtts-neuron/neff"   # not /tmp: survives reboots
+```
+
+With it, a cached talker variant starts in **1 second instead of 121–200 seconds**. Two guards against stale kernels:
+the kernel directory is added to the fingerprinted roots (kernels imported via `sys.path` are otherwise not tracked),
+and the cache directory is keyed by a hash of the kernel sources.
+
+<InCode file="neuron/engine/start_server.sh">
+The launcher exports exactly these variables. The first start after any kernel edit still pays the full warm-up.
+</InCode>

@@ -1,0 +1,51 @@
+---
+title: Tracing, compilation and the NEFF cache
+short: NEFF
+summary: A kernel call is traced into instructions, compiled into a NEFF binary and cached. Static shapes mean one binary per shape — plan your buckets.
+order: 5
+related: [patterns/static-shape-buckets, engine/cold-start-trace-cache]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+When an `@nki.jit` kernel is called, three things happen:
+
+1. **Trace.** The Python body runs symbolically. Loops over `nl.static_range` unroll, Python `if`s on static values
+   are resolved, and every `nisa` call becomes an instruction. The result is a fixed instruction list for these
+   exact shapes, dtypes and static argument values.
+2. **Compile.** `neuronx-cc` lowers the instructions, allocates SBUF / PSUM, schedules the four engine streams and
+   inserts semaphores, producing a **NEFF** (Neuron Executable File Format) binary.
+3. **Cache and run.** The NEFF is cached on disk and launched by the Neuron runtime.
+
+<Stats items={[
+  { value: '1 NEFF', label: 'per distinct shapes + static args', note: 'model' },
+  { value: '~100 s', label: 'tracing one 28-layer talker variant in Python', note: 'measured' },
+  { value: '~1 s', label: 'loading the same variant with the trace cache', note: 'measured' },
+  { value: '16', label: 'talker variants our server warms up', note: 'TTS engine' }
+]} />
+
+## Static means static
+
+Anything that changes the instruction list makes a new kernel: tensor shapes, Python ints passed as arguments, the
+length of a list argument, a `groups=((32, 1, 2), (3, 128, 0))` tuple. Two consequences:
+
+- **Bucket the shapes you serve** — and compile every bucket before taking traffic. See
+  <T id="patterns/static-shape-buckets">static shape buckets</T>.
+- **Watch the eager ops around your kernels too.** In eager PyTorch on Neuron, small ops compile per shape as well; a
+  shape first seen under traffic stalls every stream for seconds.
+
+## The cache key is the expensive part
+
+By default the NEFF cache key is computed from the *traced* kernel, so a fresh process re-traces every variant just
+to find out that the binary is already on disk. For a 28-layer kernel unrolled into tens of thousands of instructions
+that is ~100 s of Python per variant. NKI's persistent trace cache (`NKI_ENABLE_TRACE_CACHE=1`) stores the traced
+kernel too; a cached variant then loads in about a second. See <T id="engine/cold-start-trace-cache">cold start</T>.
+
+Gotcha: kernels imported from a plain directory (via `sys.path`) are not fingerprinted unless you add that directory
+to `NKI_TRACE_CACHE_ROOTS`; without it an edited helper can be served from a stale trace.
+
+<InCode file="neuron/engine/start_server.sh">
+The launcher enables the trace cache, adds the kernel directory to the fingerprinted roots, and keys the cache
+directory by a hash of `neuron/kernels/*.py` as a second guard against stale kernels.
+</InCode>

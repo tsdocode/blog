@@ -1,0 +1,68 @@
+---
+title: Codec front transformer
+short: the DMA-descriptor bug
+summary: "An 8-layer sliding-window transformer at frame rate. Compiled: 22 ms. First NKI version: 12.1 ms. After fixing its DMA descriptors: 3.3 ms."
+order: 6
+related: [hardware/dma, programming/profiling, patterns/engine-balancing]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Before the audio-rate convolutions, the codec runs an 8-layer transformer over frames (hidden 512, 16 heads of 64,
+sliding window of 72 frames). It is tiny — 59 MB of weights, 64 tokens per call for 32 streams × 2 frames — and it
+was still the most expensive part of the codec. Its story is the clearest lesson in this guide about DMAs.
+
+<Stats items={[
+  { value: '~22 ms', label: 'compiled (transposes + concat spills around its KV state)', note: 'measured' },
+  { value: '12.1 ms', label: 'first NKI kernel', note: 'measured' },
+  { value: '4.0 ms', label: 'after contiguous DMA staging', note: 'measured' },
+  { value: '3.3 ms', label: 'after moving copies to ScalarE', note: 'measured' }
+]} />
+
+## The kernel
+
+Two 64-dim heads share one 128-partition tile ("head pairs"); a block-diagonal <T id="patterns/ones-matmul">ones-matmul</T>
+computes both heads' `q · k` and broadcasts each score over its head's 64 partitions, so attention needs no
+transposes. Each stream keeps a K/V state of the last 71 frames per layer and head pair; each call appends this
+chunk's frames and writes back the newest 71.
+
+## 12.1 ms: it was not the math
+
+The first fix attempted was obvious: the kernel issued about 8,200 small DMAs per call (per layer × head pair × stream
+× K/V in/out), so the state layout was changed to keep all streams side by side and move each (layer, head pair) in
+one DMA. **12.1 → 11.25 ms.** Barely anything.
+
+The profile told the real story:
+
+```text
+device 11510.7 us | HBM rd 153.66 MB wr 74.58 MB | eff 13 GB/s read | DMA 94% TensorE 2% VectorE 27%
+```
+
+DMA 94% busy, moving data at 13 GB/s. The state was DMA'd straight into `kall[:, :, 0:R]` — a slice of a wider tile
+that also holds the new frames — so every partition's destination was strided, and each transfer split into
+128 × 32 = 4,096 descriptors of ~140 bytes instead of 128 large ones. Same bytes, 32× the descriptors.
+
+## The fix
+
+Load into a contiguous staging tile (one ~4.5 KiB descriptor per partition), then copy on chip — on-chip copies are
+cheap:
+
+```python
+kst = nl.ndarray((P, B, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+nisa.dma_copy(dst=kst, src=k_state[l, p])                     # contiguous: fast
+nisa.activation(dst=kall[:, :, 0:R], op=nl.copy, data=kst)    # on-chip, on the idle ScalarE
+```
+
+**11.6 → 4.0 ms.** The profile then showed the Vector Engine at 93% busy and the Scalar Engine at 8%, so the staging
+copies moved to ScalarE (`activation(op=copy)`): **3.3 ms.** The whole codec call dropped from 36.7 to 27.9 ms —
+about 4.4 ms off every engine step.
+
+## The lesson
+
+On a NeuronCore, a DMA's cost is its descriptor count, not its byte count. Profile before optimising: the first,
+"obvious" fix (fewer DMAs) was the wrong one.
+
+<InCode file="neuron/kernels/codec_front_kernels.py">
+`front_transformer` — state layout `[layers, head pairs, 128, streams, 71]`, staged through contiguous tiles.
+</InCode>

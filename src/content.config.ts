@@ -10,7 +10,8 @@ const posts = defineCollection({
     date: z.coerce.date(),
     readTime: z.string().default('8 min read'),
     tags: z.array(z.string()).default([]),
-    draft: z.boolean().default(false)
+    draft: z.boolean().default(false),
+    ogImage: z.string().optional()          // file in public/, used as the social card
   })
 });
 

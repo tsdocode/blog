@@ -1,0 +1,86 @@
+---
+title: A first kernel, line by line
+short: RMSNorm + linear
+summary: A 60-line fused RMSNorm + linear for decode that touches every idea — layout, DMA, ones-matmul, ScalarE activations, PSUM accumulation.
+order: 3
+related: [programming/nki, patterns/weight-tiling, patterns/ones-matmul]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+This is the first kernel written for the TTS port: `y = RMSNorm(x) @ W` for a handful of decode tokens, with
+activations transposed (`xT [K, B]`, features on partitions). It is short, but every NKI idea is in it.
+
+```python
+@nki.jit
+def rmsnorm_linear_t(xT, norm_w, w_tiled, eps=1e-6):
+    K, B = xT.shape                       # e.g. K = 2048 features, B = 32 tokens
+    NB = w_tiled.shape[0]
+    N, KT = NB * 1024, K // 128
+
+    out = nl.ndarray((N, B), dtype=xT.dtype, buffer=nl.shared_hbm)
+
+    # 1. load x as [128 partitions, K/128 tiles, B tokens]
+    x = nl.ndarray((128, KT, B), dtype=xT.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x, src=xT.reshape((KT, 128, B)).permute((1, 0, 2)))
+    w_norm = nl.ndarray((128, KT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=w_norm, src=norm_w.reshape((KT, 128, 1)).permute((1, 0, 2)))
+
+    # 2. sum of squares over ALL K features, broadcast to every partition: ones-matmul
+    ones = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones, value=1.0)
+    sum_sq = nl.ndarray((128, B), dtype=nl.float32, buffer=nl.psum)
+    for k in nl.static_range(KT):
+        sq = nl.ndarray((128, B), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=sq, op=nl.square, data=x[:, k, :])                 # ScalarE
+        nisa.nc_matmul(dst=sum_sq, stationary=ones, moving=sq, accumulate=(k > 0))  # TensorE -> PSUM
+
+    # 3. 1 / rms straight out of PSUM, scale and bias fused into the activation
+    inv_rms = nl.ndarray((128, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=inv_rms, op=nl.rsqrt, data=sum_sq, scale=1.0 / K, bias=eps)
+
+    # 4. normalise and apply the norm weight (VectorE)
+    xn = nl.ndarray((128, KT, B), dtype=xT.dtype, buffer=nl.sbuf)
+    for k in nl.static_range(KT):
+        scaled = nl.ndarray((128, B), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=scaled, data1=x[:, k, :], data2=inv_rms, op=nl.multiply)
+        nisa.tensor_scalar(dst=xn[:, k, :], data=scaled, op0=nl.multiply, operand0=w_norm[:, k, :])
+
+    # 5. stream weight blocks through SBUF; weights are the stationary operand
+    for nb in nl.affine_range(NB):
+        w_blk = nl.ndarray((128, KT, 1024), dtype=w_tiled.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=w_blk, src=w_tiled[nb])                  # one large contiguous DMA
+        for j in nl.static_range(1024 // 128):
+            acc = nl.ndarray((128, B), dtype=nl.float32, buffer=nl.psum)
+            for k in nl.static_range(KT):                          # accumulate over K in one bank
+                nisa.nc_matmul(dst=acc, stationary=w_blk[:, k, j*128:(j+1)*128],
+                               moving=xn[:, k, :], accumulate=(k > 0))
+            y = nl.ndarray((128, B), dtype=xT.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=y, src=acc)                       # evict PSUM -> SBUF (bf16)
+            col = nb * 1024 + j * 128
+            nisa.dma_copy(dst=out[col:col + 128, :], src=y)
+    return out
+```
+
+## What to notice
+
+- **Step 1 — layout.** `xT.reshape((KT, 128, B)).permute((1, 0, 2))` tiles the 2048 features over 128 partitions:
+  feature `k·128 + p` lives in partition `p`, tile `k`. See <T id="programming/partition-and-free-axes">partition and free axes</T>.
+- **Step 2 — reduce across partitions with a matmul.** The sum over features is a sum over partitions *and* over
+  tiles. A `ones[128, 128]` stationary operand sums the moving operand over its partitions and writes the result to
+  all 128 output partitions at once; `accumulate=True` adds the 16 tiles in PSUM. See <T id="patterns/ones-matmul">ones-matmul</T>.
+- **Step 3 — fused activation.** `rsqrt(sum · 1/K + eps)` is one Scalar-Engine instruction reading PSUM.
+- **Step 5 — weights as the stationary operand.** Each `128 × 128` weight tile is loaded into the array and the
+  32 tokens stream through. The weights were rearranged once on the host so each block DMA is contiguous — see
+  <T id="patterns/weight-tiling">weight tiling</T>.
+
+## How fast is it
+
+For a 2048 × 6144 matrix at 32 tokens this kernel reaches about 172 GB/s of weight streaming. Fusing whole layers
+(so the weight stream never stops between ops) took the full 28-layer talker to 247 GB/s, essentially the HBM
+ceiling.
+
+<InCode file="neuron/kernels/decode_linear.py">
+`rmsnorm_linear_t`, plus an FP8 weight-only variant (`rmsnorm_linear_fp8_t`) that halves the weight bytes. FP8 was
+1.4× faster on its own but too lossy for this model, so it stayed opt-in.
+</InCode>

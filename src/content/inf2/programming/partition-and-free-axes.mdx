@@ -1,0 +1,41 @@
+---
+title: Partition and free axes
+short: P × F layout
+summary: Every on-chip tile has a partition axis (parallel, ≤ 128) and free axes (sequential). Choosing which dimension goes where is the main design decision in a kernel.
+order: 2
+related: [hardware/sbuf, hardware/tensor-engine, patterns/ones-matmul]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+An SBUF or PSUM tile is written `[P, F1, F2, ...]`. The first dimension is the **partition axis**: up to 128, one
+per lane, processed in parallel. The rest are **free axes**, walked sequentially by each lane. An engine
+instruction costs roughly the free-axis size in cycles, almost independent of how many partitions it uses.
+
+## The rules that follow
+
+1. **Put the big parallel dimension on partitions, and fill all 128.** A `[32, 4096]` op costs as much as a
+   `[128, 4096]` one.
+2. **Matmuls contract over the partition axis.** For `y = x @ Wᵀ` with the weight as the stationary operand, both
+   operands need the input-feature dimension on partitions — so the activation tile is `[features, tokens]`.
+3. **Element-wise ops pair partition `p` with partition `p`.** You can add two tiles, or a tile and a per-partition
+   scalar `[P, 1]`, but not a row vector across partitions — broadcasting across partitions needs a matmul or a DMA.
+4. **Reductions are cheap along the free axis and expensive across partitions.** A row max over the free axis is
+   one Vector instruction; a sum over partitions is a <T id="patterns/ones-matmul">ones-matmul</T>.
+
+## Transposed activations
+
+Most of our kernels keep activations **transposed**: `xT [hidden, tokens]`, hidden dimension tiled over
+partitions as `[128, hidden/128, tokens]`. Weights are the stationary operand; every matmul output
+`[out_features, tokens]` lands in exactly the layout the next layer's matmul wants. A 28-layer transformer step runs
+with no transposes in the dense path.
+
+The exceptions are where an algorithm wants the other layout — softmax over keys wants keys or queries on the free
+axis, top-k sampling wants each stream's vocabulary on the free axis — and there the kernel either transposes on the
+<T id="hardware/tensor-engine">Tensor Engine</T> or swaps matmul operands so the result comes out the other way.
+
+<InCode file="neuron/kernels/cp_kernels.py">
+The code predictor's last layer swaps operands for the vocabulary head: the activations `[1024, streams]` become the
+stationary operand and the weights stream through, so the logits come out as `[streams, 2048]` — streams on
+partitions, vocabulary on the free axis — ready for row-wise top-k without a transpose.
+</InCode>

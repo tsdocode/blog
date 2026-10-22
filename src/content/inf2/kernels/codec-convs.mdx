@@ -1,0 +1,58 @@
+---
+title: Streaming codec convolutions
+short: SnakeBeta + conv
+summary: The audio-rate half of the codec decoder — fused SnakeBeta + dilated conv residual units, phase-decomposed transposed convs, streaming history.
+order: 5
+related: [patterns/sin-range-reduction, patterns/engine-balancing, kernels/codec-front-transformer]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The last stage turns 16 codebook tokens per frame into 1,920 audio samples (80 ms at 24 kHz). After a small
+frame-rate transformer (see <T id="kernels/codec-front-transformer">codec front transformer</T>), four upsampling
+blocks of transposed convolutions and residual units run at increasing time resolution, ending at audio rate. Every
+convolution is preceded by a **SnakeBeta** activation, `x + sin²(α x) / β`.
+
+<Stats items={[
+  { value: '37.5 ms', label: 'compiled fp32 decoder, per frame-batch', note: 'measured' },
+  { value: '9.4 ms', label: 'NKI convs + compiled front', note: 'measured' },
+  { value: '52.6 dB', label: 'audio SNR vs fp32 upstream', note: 'measured' },
+  { value: '24.9 dB', label: 'plain bf16 compiled — unusable', note: 'measured' }
+]} />
+
+## Why the compiler struggled
+
+The obvious shortcut — compile the decoder in bf16 — was only 22% faster and dropped audio quality to 24.9 dB SNR. A
+profile showed why: each SnakeBeta was several separate passes over the full audio-rate tensor, spilled to HBM between
+ops (9.8 GB read per chunk), with the Tensor Engine 16% busy.
+
+## The kernels
+
+- **`residual_unit`** — SnakeBeta → dilated `K = 7` conv → SnakeBeta → `1 × 1` conv → residual, in one pass.
+  Channels on partitions, time on the free axis; a convolution is `K` shifted, accumulating matmuls (one per tap,
+  shifted along the free axis).
+- **`snake_transconv`** — SnakeBeta + causal transposed convolution by **phase decomposition**: output sample
+  `n·r + m` is `W_mᵀ x[n] + W_{m+r}ᵀ x[n−1]`, i.e. a few ordinary matmuls per phase.
+- **`snake_conv_out`** — the last SnakeBeta, the 96 → 1 output conv and the clamp.
+
+Tricks:
+
+- `sin` with <T id="patterns/sin-range-reduction">range reduction</T> (|αx| reaches ~142).
+- For small channel counts (C ≤ 192) the kernels are Vector-bound, so SnakeBeta's two terms are fed to the conv as
+  two accumulating matmuls — the convolution is linear — removing a Vector pass (one block: 2.73 → 1.88 ms).
+- fp32 → bf16 casts go to GpSimd to unload the Vector Engine.
+
+## Streaming
+
+For serving, the decoder runs chunk by chunk (2 frames per call for all 32 streams). Each kernel takes its left
+context as an input — the last `(K − 1) · dilation` samples of the previous chunk — and returns the updated history.
+
+One bug worth sharing: the first streaming version silently dropped the last partial tile whenever the chunk length was
+not a multiple of 512 samples. Whole-sequence tests passed; streaming audio was at −0.7 dB SNR. Partial-tile loops
+fixed it (52.5 dB).
+
+<InCode file="neuron/kernels/codec_kernels.py">
+`residual_unit`, `snake_transconv`, `snake_conv_out` (all with optional `hist` input/output for streaming); the
+stateful wrapper is `StreamingCodecDecoder` in `codec_stream.py`.
+</InCode>

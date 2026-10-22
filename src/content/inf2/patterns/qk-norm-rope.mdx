@@ -1,0 +1,46 @@
+---
+title: Folding QK-norm and RoPE into matmuls
+short: rotate_half as a matrix
+summary: RoPE's rotate_half and the per-head norm weight are both linear maps — precompute them as one 128 × 128 matrix and apply them on the Tensor Engine.
+order: 3
+related: [patterns/ones-matmul, hardware/tensor-engine]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Qwen3-style attention applies, per head, an RMSNorm with a learned weight `w` and then rotary embeddings:
+
+```text
+q' = RoPE(w ⊙ q / rms(q)) = (w ⊙ q̂) · cos + rotate_half(w ⊙ q̂) · sin,     q̂ = q / rms(q)
+```
+
+`rotate_half` is a fixed permutation with sign flips, and multiplying by `w` is a diagonal matrix. Both are linear,
+so their product is a single `128 × 128` matrix `S = Perm · diag(w)`, computed once on the host:
+
+```python
+def rotate_half_norm_matrix(norm_weight):
+    """S [128,128] with nc_matmul(stationary=S, moving=x) == rotate_half(w * x)."""
+    d, h = 128, 64
+    perm = torch.zeros(d, d, dtype=torch.float64)
+    idx = torch.arange(h)
+    perm[idx, idx + h] = -1.0       # out[i]    = -x[i + 64]
+    perm[idx + h, idx] = 1.0        # out[i+64] =  x[i]
+    return (perm @ torch.diag(norm_weight.double())).t().float().contiguous()
+```
+
+With the head dimension on partitions, `rotate_half(w ⊙ q̂)` for all heads and tokens is one matmul with `S` as the
+stationary operand; the `cos` / `sin` tables (per token, built on the host) and the `1/rms` (a
+<T id="patterns/ones-matmul">ones-matmul</T> reduction) are element-wise multiplies on the Vector Engine. The
+compiler's version of the same few lines produced thousands of small shuffles and transposes.
+
+## When every row shares a position
+
+If all rows of the batch are at the same position — as in the code predictor, where every stream is at depth step
+`s` — the rotation itself is a fixed matrix too: `S_s = (R_s · diag(w))ᵀ`, precomputed for each of the 16 steps.
+Norm weight and RoPE become a single matmul, and the per-token `1/rms` is applied afterwards (it commutes with the
+linear map).
+
+<InCode file="neuron/kernels/talker_kernels.py">
+`rotate_half_norm_matrix` and `rope_tables` for the talker (positions differ per stream); `rope_norm_matrix` in
+`cp_kernels.py` for the code predictor (one matrix per depth step).
+</InCode>

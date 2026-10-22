@@ -1,0 +1,46 @@
+---
+title: Codec chunking and the first-audio replay
+short: K = 2 frames per call
+summary: Run the codec every 2 steps to amortise its fixed cost — and use a causal-decode replay trick so new streams still get audio after one frame.
+order: 2
+related: [kernels/codec-convs, kernels/codec-front-transformer, engine/lockstep-batching]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+A codec call for all 32 streams has a large fixed cost and a small per-frame cost, so decoding 2 frames per call
+every 2 steps is much cheaper than 1 frame every step:
+
+| Frames per call (B = 32) | ms per call | ms per frame |
+| --- | ---: | ---: |
+| 1 | 19.7 | 19.7 |
+| 2 | 27.9 | 13.9 |
+| 4 | 48.5 | 12.1 |
+
+The engine uses 2: most of the saving, with at most one step of extra latency.
+
+## The cost: new streams wait for 2 frames
+
+With chunking, a stream's first audio needs 2 frames *and* a codec step, so a new stream can wait 1–2 extra steps
+(~60–130 ms) before its first audio byte — which is time to first audio (TTFA), the metric users feel.
+
+## The replay trick
+
+The codec decoder is causal: the audio for frame 1 depends only on frame 1 and earlier. So at a codec step:
+
+1. A **new** stream with only 1 frame is decoded with a zero frame as padding. Its first 1,920 samples are exact —
+   the padding cannot affect them — and are sent immediately.
+2. Its codec state is now polluted by the zero frame, so the row is **reset**.
+3. On the next codec call, the stream **replays** frame 1 together with frame 2 from the fresh state, and only frame 2's
+   audio is sent.
+
+The audio is identical to normal decoding: against a whole-sequence fp32 decode of the same frames, the streamed
+output is at 46–48 dB SNR with exactly the same sample count, as before the change. Every new request gets its first
+audio up to two steps sooner. (Implemented and tested for audio correctness; its effect on load-test TTFA is not
+measured yet.)
+
+<InCode file="neuron/engine/neuron_engine.py">
+The codec section of `step()`: per-stream `replay` count, zero-padded first chunk, and `_reset_codec_row`, which zeroes
+one row of every codec state tensor with a keep-mask multiply (a Python-int index would compile a new op per row value).
+</InCode>

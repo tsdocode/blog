@@ -1,0 +1,62 @@
+---
+title: Varlen packed prefill
+short: FlashAttention-varlen, on NKI
+summary: New prompts packed back to back into 128-token tiles with a block-diagonal causal mask — no padding, no cache reads, and 1.7× cheaper per prompt.
+order: 3
+related: [kernels/talker-step, kernels/paged-kv-attention, patterns/static-shape-buckets]
+---
+import PackedMaskDiagram from '../../../components/inf2/PackedMaskDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+On GPUs, mixed batches of different-length prompts are handled with FlashAttention's *varlen* functions: sequences
+are concatenated without padding, and a list of offsets tells the kernel where each one starts. This is the same idea
+for a NeuronCore, inside the fused <T id="kernels/talker-step">talker step</T>.
+
+<Stats items={[
+  { value: '17–32', label: 'tokens in a typical TTS prompt', note: 'measured' },
+  { value: '4–7', label: 'prompts per 128-token tile', note: 'TTS engine' },
+  { value: '42.3 ms', label: 'talker step with 3 tiles = 9 prompts of 40 tokens', note: 'measured' },
+  { value: '62.8 ms', label: 'talker step with 8 prompts padded to 64, before', note: 'measured' }
+]} />
+
+<Diagram label="Packed prefill and its mask" caption="Prompts are packed first-fit into 128-token tiles (a prompt never straddles a tile). The mask is block-diagonal and causal: a query sees keys of its own prompt at or before its position.">
+  <PackedMaskDiagram />
+</Diagram>
+
+## Why fresh prompts are easy
+
+A new prompt has no earlier context, so every key it attends to is computed in this same step. The kernel already
+has those keys and values in SBUF, so prefill attention needs **no KV-cache reads and no K transposes**. The keys are
+still written to the paged cache for the decode steps that follow.
+
+## The kernel
+
+Per 128-token tile and group of 4 query heads:
+
+1. `S[queries, keys] = Q · Kᵀ` — queries on partitions, so the softmax runs along the free axis. Four heads' scores
+   fill one PSUM bank.
+2. One Vector instruction adds the mask to all four heads; one reduce takes the row max; one Scalar instruction
+   computes `exp`; one reduce sums; one multiply normalises.
+3. Transpose `P` (one matmul per head) and multiply by `V` (transposed once per KV head) to get the output in the
+   `[d, tokens]` layout the next projection wants.
+
+Processing four heads per instruction matters: the first version did one head at a time, and its chain of small
+dependent instructions was latency-bound.
+
+## Results
+
+- **Cost:** with 40-token prompts, 3 packed tiles hold 9 prompts and the talker step takes 42.3 ms; 8 prompts
+  padded to 64 tokens took 62.8 ms — 1.7× less step time per prompt. Real TTS prompts (17–32 tokens) are shorter, so
+  more fit per tile. Most of the saving is removed padding; the rest is keeping the step under 512 tokens.
+- **Accuracy:** against an fp32 reference, the packed path's prompt hidden states are slightly *closer* than the
+  padded path's (1.46e-1 vs 1.59e-1 relative L2 — both at this model's bf16 drift level); decode rows are bit-identical.
+- **TTFA:** a burst of 32 requests on one core is admitted in 3 steps instead of 4 (first audio arrives in three
+  waves instead of four).
+
+<InCode file="neuron/kernels/talker_kernels.py">
+`_attend_packed` and `packed_prefill_mask` (host: block-diagonal causal mask from per-token segment ids). The engine
+packs prompts first-fit in FIFO order; see `step()` in `neuron/engine/neuron_engine.py`.
+</InCode>

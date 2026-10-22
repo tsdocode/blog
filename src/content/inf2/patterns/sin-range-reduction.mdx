@@ -1,0 +1,40 @@
+---
+title: sin range reduction
+short: (q + 1.5·2²³) − 1.5·2²³
+summary: The Scalar Engine's sin is only valid on [−π, π]. Reduce the argument with an fp32 rounding trick, because there is no fmod.
+order: 5
+related: [hardware/scalar-engine, kernels/codec-convs]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The codec decoder's SnakeBeta activation is `x + sin²(α x) / β`, applied to every channel of every audio sample —
+millions of `sin` evaluations per call. The <T id="hardware/scalar-engine">Scalar Engine</T> has a hardware `sin`,
+but it is only accurate on `[−π, π]`, and in this model `|α x|` reaches about 142.
+
+## The trick
+
+`sin²` has period π, so only `α x / π` modulo 1 matters. Without an `fmod` instruction, rounding to the nearest
+integer can be done in fp32 arithmetic: adding `1.5 · 2²³` pushes the fractional bits out of the mantissa, and
+subtracting it back leaves the rounded value.
+
+```python
+q  = activation(copy, x, scale=alpha / pi)          # ScalarE: q = αx/π
+rq = tensor_scalar(q, add, 12582912.0,              # VectorE: round(q) via (q + 1.5·2²³) − 1.5·2²³
+                      subtract, 12582912.0)
+r  = tensor_tensor(q, rq, subtract)                 # r in [−0.5, 0.5]
+s  = activation(sin, r, scale=pi)                   # sin(π r), argument in [−π/2, π/2]
+s2 = activation(square, s, scale=sqrt(1 / beta))    # sin²(αx) / β
+```
+
+Since `sin²(π r) = sin²(α x)`, this is exact up to fp32 rounding for `|q| < 2²²`.
+
+## The general lesson
+
+Hardware transcendental functions on accelerators often have restricted domains. Check the valid range for each
+function you use, and when you need a classic libm trick (argument reduction, `frexp`, `fmod`), look for a
+floating-point identity that the engines can do in a couple of instructions.
+
+<InCode file="neuron/kernels/codec_kernels.py">
+`_snake_terms`: the range-reduced SnakeBeta, shared by the residual units and the transposed-convolution blocks.
+</InCode>

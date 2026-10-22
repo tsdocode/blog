@@ -1,0 +1,38 @@
+---
+title: Balancing work across engines
+short: who does what
+summary: The four engines run in parallel, so a kernel is as slow as its busiest engine. Profile, then move work to the idle ones.
+order: 4
+related: [hardware/neuroncore-v2, hardware/vector-engine, hardware/scalar-engine, programming/profiling]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Because each engine runs its own instruction stream, a kernel's time is roughly the time of its busiest engine,
+not the sum. The useful question for any slow kernel is "which engine is at 90%?" — and the answer is often not the
+Tensor Engine.
+
+## What can move where
+
+| Work | Natural engine | Can also run on |
+| --- | --- | --- |
+| matmul, transpose, cross-partition sum | Tensor | — |
+| two-input element-wise, masks, reductions | Vector | GpSimd (limited) |
+| one-input element-wise, `exp`, `silu`, `rsqrt` | Scalar | Vector (simple arithmetic) |
+| SBUF → SBUF copy | Vector | Scalar (`activation(op=copy)`), GpSimd |
+| cast fp32 → bf16 | Vector | Scalar, GpSimd |
+| PSUM eviction | Vector | Scalar (not GpSimd: no PSUM access) |
+
+## Tricks that remove work entirely
+
+- **Fuse into the eviction.** The copy out of PSUM can carry a bias, residual add, scale or activation.
+- **Fold an add into a matmul.** If the next op is a convolution or linear, `conv(x + s) = conv(x) + conv(s)`: feed
+  `x` and `s` as two accumulating matmuls instead of spending a Vector pass on the add — the Tensor Engine usually
+  has slack in memory-bound kernels.
+- **Fuse the scale.** Scalar's `f(x · scale + bias)` absorbs a preceding multiply-add for free.
+
+<InCode file="neuron/kernels/codec_kernels.py">
+SnakeBeta followed by a convolution feeds its two terms (`x` and `sin²(αx)/β`) as separate accumulating matmuls for
+small channel counts, removing one full Vector pass at audio sample rate; the codec transformer moved its staging
+copies to ScalarE (VectorE 93% → balanced, 4.0 → 3.3 ms).
+</InCode>

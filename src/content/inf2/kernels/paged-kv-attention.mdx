@@ -1,0 +1,59 @@
+---
+title: Paged KV attention
+short: decode attention
+summary: Each stream's KV cache lives in 128-token pages anywhere in HBM; the kernel gathers pages by id, transposes K on the Tensor Engine and attends.
+order: 2
+related: [programming/indirect-dma, kernels/talker-step, performance/matmul-cost]
+---
+import PagedKvDiagram from '../../../components/inf2/PagedKvDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Continuous batching means streams start and finish at different times, so each stream's KV cache cannot be one
+contiguous buffer. As in vLLM's PagedAttention, the cache is a pool of fixed-size **pages** (128 tokens) and each
+stream has a block table listing its pages.
+
+<Diagram label="Paged KV cache layout" caption="Block tables live on the host. Each page is one contiguous 256 KiB region per layer, so reading a page is a single DMA with a runtime offset; writing this step's tokens is a single scatter DMA per layer.">
+  <PagedKvDiagram />
+</Diagram>
+
+## Layout: token-major
+
+The cache is `[layer, block, 128 tokens, 8 KV heads, 128 dims]`. Two reasons for token-major:
+
+- **Writes.** A new token's K for one layer is one contiguous 2 KiB row, and all of a step's tokens go out in one
+  `vector_offset` scatter. A dimension-major K (ready for Q·Kᵀ) needed 128 tiny writes per token — 49 ms for a
+  96-token step.
+- **Reads.** A whole page is one contiguous region, gathered with one `scalar_offset` DMA (243 GB/s measured —
+  about twice the per-partition `vector_select` alternative).
+
+The price is that Q·Kᵀ needs K with the head dimension on partitions, so each page is transposed on the Tensor
+Engine (a matmul with the identity) after it arrives.
+
+## The attention itself
+
+Per layer, per chunk of up to 4 streams, per KV head:
+
+1. Transpose each page's K for this head: `[128 keys, 128 d] → [128 d, 128 keys]`.
+2. Scores with **keys on partitions**: `S[keys, queries]`, with the transposed K page as the stationary operand
+   and the queries moving — one matmul per page.
+3. Add the causal mask (−30000 for keys past each query's position), max over keys (a free-axis reduce over pages,
+   then one transpose for the partition axis), `exp`, sums via a ones-matmul.
+4. `P · V` accumulated over pages in PSUM; V pages are already `[keys, d]`.
+
+Pages for chunk `c + 1` are DMA'd into a second buffer while chunk `c` computes (ping-pong), and padding pages —
+ids past the end of the whole cache — are skipped by the DMA entirely.
+
+## Why it is the slowest part of the step
+
+Decode has one query per stream: the moving operand of the Q·Kᵀ and P·V matmuls is 2 columns wide (two query heads
+per KV head). Each of those matmuls, and each transpose, pays the Tensor Engine's fixed per-instruction cost.
+With 32 streams, 3 pages each, 8 KV heads and 28 layers, the profile counted about **78,000 attention matmuls per
+step**, and attention costs ~8 ms against a byte floor of ~3 ms. Fewer, wider matmuls — for example computing P·V for all 16 heads of a page in two
+512-column matmuls — is the next optimisation. See <T id="performance/matmul-cost">the matmul cost model</T>.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+`_attend_group` (decode and the older padded prefill path), `build_group_metadata` (page ids and masks, vectorised on
+the host), `kv_write_indices` and `_write_kv` (the scatter).
+</InCode>

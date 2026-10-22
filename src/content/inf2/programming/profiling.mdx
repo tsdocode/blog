@@ -1,0 +1,53 @@
+---
+title: Profiling a kernel
+short: neuron-explorer
+summary: Capture a device trace of one NEFF and read per-engine busy time, instruction counts and HBM traffic — the only reliable way to know what a kernel is bound by.
+order: 6
+related: [performance/matmul-cost, hardware/dma, kernels/codec-front-transformer]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Wall-clock time tells you a kernel is slow; a device profile tells you why. The Neuron tools capture an
+execution trace of one NEFF on one core and break it down per engine and per instruction.
+
+## The loop
+
+```bash
+# 1. find the NEFF (compiled binaries live in the NEFF cache)
+TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/fresh python bench_kernel.py      # fresh dir: the only NEFFs are yours
+# 2. capture + ingest + summarise (our wrapper around neuron-explorer capture / view)
+python neuron/tools/profile_neff.py /tmp/fresh/.../kernel.neff --name my_kernel --core 0
+```
+
+The summary line is the first thing to read:
+
+```text
+[cfront_b32] device 11510.7 us | HBM rd 153.66 MB wr 74.58 MB | eff 13 GB/s read | DMA 94% TensorE 2% VectorE 27% ...
+    vector  TENSOR_TENSOR   n=  1676   2247.4 us
+    vector  TENSOR_REDUCE   n=   384    848.6 us
+    tensor  MATMUL          n=  2824    270.6 us
+```
+
+## How to read it
+
+- **One engine near 100% busy** → that engine is the bottleneck. Move work off it or give it fewer, wider
+  instructions.
+- **DMA busy but low effective GB/s** → descriptor-bound: many small transfers. This exact line (DMA 94%, 13 GB/s)
+  is what exposed the strided-SBUF bug in <T id="kernels/codec-front-transformer">the codec front transformer</T>.
+- **TensorE busy with huge `MATMUL` and `LDWEIGHTS` counts** → many tiny matmuls; see
+  <T id="performance/matmul-cost">the matmul cost model</T>.
+- **Big HBM writes you did not ask for** → the compiler is spilling SBUF.
+
+## Gotcha: make sure you profile the right binary
+
+The NEFF cache is shared by every kernel you have ever compiled, and a cached kernel is not rewritten — so "the newest
+file" may not be the kernel you just ran. Point `TORCH_NEURONX_NEFF_CACHE_DIR` at an empty directory for the
+profiling run.
+
+<InCode file="neuron/tools/profile_neff.py">
+Captures with `neuron-explorer capture`, ingests to parquet, and prints per-engine busy percentages, HBM traffic and
+the top instructions by time.
+</InCode>
+
+Source: [Neuron profiler for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/use-neuron-profile.html).

@@ -1,0 +1,42 @@
+---
+title: One process per NeuronCore
+short: 2 engines + router
+summary: Two engines in one Python process fight over the GIL. One process per core behind a small streaming router took 64 streams from 1.19 to 1.09 RTF.
+order: 3
+related: [hardware/inferentia2-chip, engine/lockstep-batching, engine/cold-start-trace-cache]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+An inf2.xlarge has two NeuronCores and only 4 vCPUs. The first server ran both engines as threads in one process. The
+kernels ran fine, but each engine step also has ~10 ms of Python (batch building, sampling, sending audio), and two
+engines in one interpreter share the GIL. At 64 streams the steps stretched past the 80 ms budget.
+
+## The fix
+
+One server process per core, each pinned with `NEURON_RT_VISIBLE_CORES`, and a tiny streaming reverse proxy in front
+that routes each request to the backend with the most free slots:
+
+```bash
+NEURON_RT_VISIBLE_CORES=0 python neuron/engine/server.py --cores 1 --port 8001 &
+NEURON_RT_VISIBLE_CORES=1 python neuron/engine/server.py --cores 1 --port 8002 &
+python neuron/engine/router.py --backends http://127.0.0.1:8001 http://127.0.0.1:8002 --port 8000
+```
+
+| 64-stream load test | RTF | Aggregate | Steady-state TTFA p99 |
+| --- | ---: | ---: | ---: |
+| 2 engines, 1 process | 1.19 | 51.8× | 445 ms |
+| 1 process per core | 1.09 | 56.2× | 425 ms |
+
+## Two gotchas from the same week
+
+- **Global state is part of the compiled graph.** `torch.set_num_threads` is a guard in PyTorch's compiler cache:
+  calling it in the serving thread (after warm-up) made every compiled graph recompile on its first serving step — a
+  2.5 s stall for every stream in flight. Set it once, before warm-up.
+- **Host RAM.** A process needs much more host RAM while loading (the model plus a re-tiled copy of its weights —
+  roughly 8–9 GB by my estimate) than once serving. On a 16 GB machine, start the backends one after the other;
+  starting the second while the first was still large once ran the machine out of memory.
+
+<InCode file="neuron/engine/start_server.sh">
+Starts the two backends sequentially, waits for each `/ready`, then starts the router on port 8000.
+</InCode>

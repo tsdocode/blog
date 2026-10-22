@@ -188,7 +188,7 @@ button, input { font: inherit; }
   .default-welcome, .published-welcome { grid-template-columns: 1fr; gap: 12px; padding: 52px 0 60px; }.welcome-number, .published-welcome .welcome-number { padding: 0; }.topic-strip, .not-found { align-items: flex-start; flex-direction: column; gap: 12px; }.topic-strip { padding-top: 22px; }.not-found { display: flex; padding: 78px 0 120px; }
   .feature-grid { grid-template-columns: 1fr; padding-bottom: 52px; }
   .page-frame { display: block; }
-  .layout { grid-template-columns: 1fr; padding-top: 38px; }
+  .layout { grid-template-columns: minmax(0, 1fr); padding-top: 38px; }
   .toc { display: none; }
   .right-rail { display: none; }
   .nav-links { display: none; }

@@ -1,0 +1,73 @@
+---
+title: Roofline on a NeuronCore
+short: 92 TFLOPS / 257 GB/s
+summary: Where each TTS kernel sits against the per-core compute and bandwidth roofs — decode is on the bandwidth roof, prefill is compute-bound.
+order: 2
+related: [hardware/hbm, hardware/tensor-engine, performance/matmul-cost]
+---
+import VegaChart from '../../../components/VegaChart.astro';
+import T from '../../../components/inf2/T.astro';
+
+A roofline plots achieved throughput against **arithmetic intensity** (FLOPs per byte moved from HBM). For one
+NeuronCore the two roofs are the Tensor Engine peak (~92 bf16 TFLOPS) and the measured HBM → SBUF bandwidth
+(257 GB/s). They meet at about **360 FLOP/byte**: below that a kernel is bandwidth-bound, above it compute-bound.
+
+A decode step with `B` tokens does 2 FLOPs per weight per token and reads each 2-byte weight once, so its intensity is
+just `B` FLOP/byte. With 32 streams that is 32 — far below the ridge, so decode is a bandwidth problem no matter how
+good the kernel is.
+
+<VegaChart
+  title="Roofline for one NeuronCore-v2 with the TTS kernels"
+  spec={{
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    width: "container",
+    height: 320,
+    encoding: {
+      x: { field: "ai", type: "quantitative", scale: { type: "log", domain: [4, 2000], nice: false }, title: "arithmetic intensity (FLOP / byte)" },
+      y: { field: "tf", type: "quantitative", scale: { type: "log", domain: [1, 150], nice: false }, title: "achieved TFLOPS" }
+    },
+    layer: [
+      { data: { values: [ { ai: 4, tf: 1.03 }, { ai: 358, tf: 92 }, { ai: 2000, tf: 92 } ] },
+        mark: { type: "line", color: "#9aa3ad", strokeDash: [5, 4], strokeWidth: 2 } },
+      { data: { values: [ { ai: 1900, tf: 112, label: "Tensor Engine peak ≈ 92 TFLOPS", align: "right" }, { ai: 14, tf: 1.9, label: "HBM 257 GB/s", align: "left" } ] },
+        mark: { type: "text", fontSize: 11, color: "#9aa3ad" },
+        encoding: { text: { field: "label" }, align: { field: "align" } } },
+      { data: { values: [
+          { kernel: "Talker dense, 32 decode tokens", ai: 32, tf: 8.2, label: "talker dense (decode)", dy: -12 },
+          { kernel: "Code predictor frame, 32 streams", ai: 32, tf: 5.8, label: "code predictor", dy: 14 },
+          { kernel: "Talker step + 3 prefill tiles", ai: 416, tf: 27.7, label: "talker + 384 prefill tokens", dy: 14 }
+        ] },
+        layer: [
+          { mark: { type: "point", filled: true, size: 120, color: "#5146f5" },
+            encoding: { tooltip: [{ field: "kernel" }, { field: "ai", title: "FLOP/B" }, { field: "tf", title: "TFLOPS" }] } },
+          { transform: [{ filter: "datum.dy < 0" }], mark: { type: "text", align: "right", dx: -10, dy: -10, fontSize: 11, color: "#656a76" },
+            encoding: { text: { field: "label" } } },
+          { transform: [{ filter: "datum.dy > 0" }], mark: { type: "text", align: "left", dx: 9, dy: 14, fontSize: 11, color: "#656a76" },
+            encoding: { text: { field: "label" } } }
+        ] }
+    ]
+  }}
+/>
+
+| Kernel (one core) | FLOP / byte | Achieved | Bound | Of its roof |
+| --- | ---: | ---: | --- | ---: |
+| Talker dense, 32 decode tokens | 32 | 8.2 TFLOPS (11.0 ms) | bandwidth | ~100% |
+| Code predictor frame, 32 streams | 32 | 5.8 TFLOPS (14.3 ms) | bandwidth | ~70% |
+| Talker step with 384 prefill tokens | ~416 | 27.7 TFLOPS (42.3 ms) | compute | ~30% |
+
+How the points were computed: FLOPs = 2 × parameters × tokens (attention and other ops ignored); bytes = weight bytes
+(KV-cache reads ignored). The talker has 1.41 B layer parameters (2.82 GB in bf16), the code predictor ~81 M read 16
+times per frame.
+
+## Reading it
+
+- **Decode is done when it is on the bandwidth roof.** The talker's dense path is there; the only ways up are more
+  streams per step (higher intensity) or fewer bytes per weight (FP8).
+- **The code predictor has ~30% left** — its matmuls are small and its 16 steps are sequential.
+- **Prefill is far below the compute roof** — attention, per-instruction overheads and the decode rows sharing the step
+  all count against it.
+- **The two cores have separate rooflines** but share HBM: both together measured ~508 GB/s, so running two engines
+  does not halve either one's bandwidth.
+
+Note that the 92 TFLOPS roof is the datasheet peak; see <T id="performance/matmul-cost">the matmul cost model</T> for
+what limits real kernels below it.

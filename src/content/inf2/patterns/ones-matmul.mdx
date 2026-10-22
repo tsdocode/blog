@@ -1,0 +1,41 @@
+---
+title: Ones-matmul reductions and broadcasts
+short: ones @ x
+summary: Sum across partitions — and broadcast the result back to every partition — with a single matmul against a matrix of ones.
+order: 2
+related: [programming/partition-and-free-axes, hardware/tensor-engine, programming/first-kernel]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The Vector and Scalar engines cannot reduce *across* partitions. But a matmul contracts over the partition axis by
+definition, so with a stationary operand of all ones:
+
+```text
+out[m, n] = Σ_p ones[p, m] · x[p, n] = Σ_p x[p, n]       for every m = 0..127
+```
+
+one `nc_matmul(stationary=ones[128, 128], moving=x[128, N])` writes the column sums of `x` into **all 128 output
+partitions** — a reduction and a broadcast in one instruction, accumulated in PSUM if you need more than 128 rows.
+
+## Where it shows up
+
+- **RMSNorm over features on partitions.** Square, ones-matmul (accumulating over the feature tiles), then `rsqrt`
+  — every partition ends up holding the same `1/rms` per token, ready for an element-wise multiply.
+- **Per-head norms with block-diagonal ones.** With two 64-dim heads packed into one 128-partition tile, a
+  block-diagonal matrix (two `64 × 64` blocks of ones) sums each head separately and broadcasts each head's sum over
+  its own 64 partitions.
+- **Attention scores without per-row matmuls.** Multiply `q ⊙ K` element-wise for all heads and slots at once, then
+  one ones-matmul sums over the head dimension and broadcasts the score — this is how the short (≤ 16 slot)
+  code-predictor attention works.
+
+## Cost
+
+The matmul is cheap — one Tensor Engine instruction instead of a long cross-partition shuffle — but it is a matmul:
+on fp32 inputs it costs 4× bf16, and like every matmul it has a fixed overhead per call. Reduce wide tiles at once
+rather than column by column.
+
+<InCode file="neuron/kernels/codec_front_kernels.py">
+The codec transformer computes q·k for both heads of a head pair with one block-diagonal ones-matmul, which also
+broadcasts each head's score over its 64 partitions so the softmax and the P·V product need no reshuffling.
+</InCode>

@@ -1,0 +1,65 @@
+---
+title: Code predictor frame, on-chip sampling
+short: cp_frame
+summary: 16 sequential depth steps of a 5-layer transformer plus top-50 sampling and embedding lookups — one kernel launch per audio frame.
+order: 4
+related: [programming/indirect-dma, programming/partition-and-free-axes, performance/gen2-gotchas]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+After the talker picks codebook 0, Qwen3-TTS's **code predictor** fills in the other 15 codebooks of the frame, one
+after another: a small 5-layer transformer (hidden 1024) runs 16 depth steps per frame, and each step's sampled
+token selects the next step's input embedding. That is a strictly sequential loop — and on the host, every step was a
+kernel launch, a sampler launch and a round trip.
+
+<Stats items={[
+  { value: '16', label: 'sequential depth steps per frame', note: 'model' },
+  { value: '1', label: 'kernel launch per frame (was 31)', note: 'TTS engine' },
+  { value: '14.3 ms', label: 'per frame, 32 streams (was 19.0)', note: 'measured' },
+  { value: '100%', label: 'token agreement with the per-step path', note: 'measured' }
+]} />
+
+## Everything stays on chip
+
+One `cp_frame` launch runs, for all 32 streams:
+
+1. **16 depth steps of the 5-layer transformer**, with its tiny KV cache (≤ 16 slots) written in place. Attention over
+   ≤ 16 slots uses element-wise `q ⊙ K` and a ones-matmul instead of per-row matmuls; the per-step RoPE and norm
+   weight are folded into one matrix per step (see <T id="patterns/qk-norm-rope">QK-norm and RoPE</T>).
+2. **The vocabulary head with streams on partitions.** Swapping matmul operands produces logits as
+   `[streams, 2048]`, so each stream's vocabulary is on the free axis.
+3. **Top-50 sampling per stream:**
+   - 7 rounds of `max8` (the 8 largest values per partition) plus `nc_find_index8` (their positions), with
+     `nc_match_replace8` knocking out each round's winners — 56 sorted candidates, the first 50 used;
+   - `exp((v − v_max) · 1/T)`, then the CDF as a transpose plus a matmul with a triangular matrix of ones;
+   - inverse-CDF sampling with host-supplied uniforms: count the CDF entries below `u · total`, then a one-hot select
+     of the token index.
+4. **The next input.** The sampled token ids are converted to int32 and used as a `vector_offset` gather of the
+   projected embedding rows (see <T id="programming/indirect-dma">indirect DMA</T>), transposed on the Tensor Engine
+   back to `[1024, streams]`.
+
+Only the 15 sampled tokens per stream go back to the host.
+
+## Same algorithm, same tokens
+
+The sampler follows exactly the reference algorithm (top-k with per-stream temperature, inverse CDF with the same
+uniforms, argmax for greedy streams), and against the per-step path with the same random numbers the tokens agree
+100%, greedy and sampled.
+
+## Gen2 surprises
+
+Two "obvious" instructions failed to compile on NeuronCore-v2:
+
+- `nc_match_replace8` **with** its `dst_idx` output is unimplemented → indices come from `nc_find_index8` on an
+  untouched copy of the logits.
+- `tensor_scalar_cumulative` (a running sum) compiled on its own but failed to lower in this kernel → the CDF became
+  two small matmuls.
+
+See <T id="performance/gen2-gotchas">gen2 gotchas</T> for the full list.
+
+<InCode file="neuron/kernels/cp_kernels.py">
+`cp_frame`, `_sample_rows`, `_sample_consts`, `_embed_t` and `_head_rows`; validated by `neuron/tests/test_cp_frame.py`
+against the 16-launch path (`cp_step` + a compiled sampler) with identical uniforms.
+</InCode>

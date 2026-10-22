@@ -1,0 +1,43 @@
+---
+title: Weight tiling for DMA
+short: tile_weight
+summary: Rearrange every weight once on the host so each block a kernel loads is one large contiguous run per partition.
+order: 1
+related: [hardware/dma, programming/first-kernel, hardware/hbm]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+A decode step is a weight-streaming problem: every step reads every weight once, so the kernel is only as fast as its
+weight DMAs. A PyTorch `Linear` weight is stored `[out, in]`, row-major. The Tensor Engine wants tiles of
+`Wᵀ` with the input dimension on partitions — and if you DMA those straight out of the row-major tensor, each
+partition receives many short, strided pieces. See <T id="hardware/dma">DMA engines and descriptors</T>.
+
+## The fix: tile once, at load time
+
+```python
+def tile_weight(weight):              # torch Linear weight [N, K]
+    """-> [N / 1024, 128, K / 128, 1024]: element [nb, p, kt, c] = Wᵀ[kt·128 + p, nb·1024 + c]."""
+    n, k = weight.shape
+    wT = weight.t()
+    return wT.reshape(k // 128, 128, n // 1024, 1024).permute(2, 1, 0, 3).contiguous()
+```
+
+Block `nb` covers 1024 output columns. Inside it, partition `p` holds every input feature `kt·128 + p` for those
+columns — one contiguous run of `K/128 × 1024 × 2` bytes (32 KiB for `K = 2048`). Loading a block is then one DMA
+with one large descriptor per partition, and the kernel slices `[:, kt, j·128:(j+1)·128]` to get each stationary
+`128 × 128` tile.
+
+## Variations
+
+- **Fused projections.** Concatenate Q, K and V (or gate and up) along the output dimension before tiling, so one
+  pass over the input produces all of them.
+- **Interleaving for fused epilogues.** For SwiGLU the gate and up columns can be interleaved block-wise, so a single
+  PSUM eviction sees matching gate and up tiles and writes `silu(gate) · up` directly.
+- **Padding.** Pad the output dimension to a multiple of the block (and ignore the extra outputs) rather than writing
+  a ragged last block.
+
+<InCode file="neuron/kernels/decode_linear.py">
+`tile_weight` is used for every talker, code-predictor and codec-transformer projection. With it, the talker's dense
+path streams 2.82 GB per step at 247 GB/s, against a measured ceiling of ~257 GB/s per core.
+</InCode>

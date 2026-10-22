@@ -1,0 +1,56 @@
+---
+title: Indirect DMA (gather and scatter)
+short: scalar_offset / vector_offset
+summary: DMAs whose addresses come from runtime data — page tables, token ids — via one runtime offset per transfer or one per partition.
+order: 4
+related: [hardware/dma, kernels/paged-kv-attention, kernels/cp-frame]
+---
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Kernel shapes are static, but serving needs data-dependent addresses: which KV-cache page belongs to this stream,
+which embedding row this sampled token selects. NKI expresses these as DMAs over an **access pattern with a
+runtime offset**, written with `.ap(...)` on the HBM tensor.
+
+## One offset per transfer: `scalar_offset`
+
+The offset is a single runtime value (read from a small SBUF tile) added to the whole access pattern. A paged KV
+cache viewed as `[num_blocks, PAGE · KVH · D]` (one row per page) loads a page with:
+
+```python
+nisa.dma_copy(
+    dst=kp[:, i, :],                                         # [128 keys, KVH·D] in SBUF
+    src=k_pages.ap(pattern=[[KVH * D, 128], [1, KVH * D]], offset=0,
+                   scalar_offset=page_ids[0:1, i:i + 1], indirect_dim=0),
+    oob_mode=nisa.oob_mode.skip)                             # out-of-range id: skip, leave buffer as is
+```
+
+## One offset per partition: `vector_offset`
+
+The offset is a `[P, 1]` int32 tile, one row index per partition. That is a gather (HBM → SBUF) or scatter (SBUF →
+HBM) of up to 128 rows in one transfer — one token per partition:
+
+```python
+# scatter this step's K for up to 128 tokens: token t -> cache row rows[t]
+nisa.dma_copy(
+    dst=k_rows.ap(pattern=[[KVH * D, tn], [1, KVH * D]], offset=0, vector_offset=rows, indirect_dim=0),
+    src=k_tok.reshape((tn, KVH * D)),                       # tokens on partitions, one 2 KiB row each
+    oob_mode=nisa.oob_mode.skip)
+```
+
+## Rules that matter
+
+- **Make each indexed row large and contiguous.** Every runtime-addressed row costs a descriptor. A token-major
+  cache (one 2 KiB row per token) scatters cheaply; a dimension-major one needs 128 tiny writes per token.
+- **Padding via out-of-bounds ids.** With `oob_mode.skip`, an index past the end of the tensor is silently skipped
+  — the standard way to pad a static batch. **The bound is the whole allocation, not your view of it**: for a
+  stacked `[layers, blocks, ...]` cache, "one past the end of layer `l`" is block 0 of layer `l + 1`. Pick an id past
+  the end of the entire tensor.
+- On NeuronCore-v2 the indices live in SBUF and the descriptors are generated at runtime — fine for a few dozen
+  pages per layer, expensive per element. See <T id="hardware/dma">DMA engines and descriptors</T>.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+`kv_write_indices` gives padding tokens a row past the end of the whole stacked cache. An earlier version used a row
+just past one layer's view — which is block 0 of the next layer, so every step with padding overwrote token 0 of
+whichever stream owned block 0, in every layer.
+</InCode>

@@ -1,0 +1,63 @@
+---
+title: The matmul cost model
+short: ~130 ns per instruction
+summary: On a NeuronCore a small matmul costs about the same as a medium one. Count instructions, not FLOPs — and make every matmul wide.
+order: 1
+related: [hardware/tensor-engine, kernels/paged-kv-attention, performance/roofline]
+---
+import VegaChart from '../../../components/VegaChart.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The <T id="hardware/tensor-engine">Tensor Engine</T> is a deep pipeline: what limits it is how often it can start a
+new instruction, not the arithmetic inside one. I measured it directly — a kernel issuing 2,048 back-to-back
+`nc_matmul`s with a `128 × 128` stationary tile and a moving tile of `N` columns:
+
+<VegaChart
+  title="Cost per nc_matmul versus moving columns"
+  spec={{
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    width: "container",
+    height: 260,
+    data: { values: [
+      { N: 2, ns: 133.3 },
+      { N: 128, ns: 135.1 },
+      { N: 512, ns: 345.1 }
+    ] },
+    layer: [
+      { mark: { type: "line", point: { size: 70 }, color: "#5146f5", strokeWidth: 2.5 },
+        encoding: {
+          x: { field: "N", type: "quantitative", title: "moving tile width N (columns)", scale: { domain: [0, 520] } },
+          y: { field: "ns", type: "quantitative", title: "ns per matmul", scale: { domain: [0, 400] } }
+        } },
+      { mark: { type: "text", dy: -14, fontSize: 11, color: "#656a76" },
+        encoding: { x: { field: "N", type: "quantitative" }, y: { field: "ns", type: "quantitative" }, text: { field: "ns", type: "quantitative", format: ".0f" } } }
+    ]
+  }}
+/>
+
+| Moving tile | ns per matmul | Useful work |
+| --- | ---: | --- |
+| 2 columns (one decode query, 2 heads) | 133 | 1.6% of a full matmul |
+| 128 columns | 135 | 25% |
+| 512 columns (one full PSUM bank) | 345 | 100% |
+
+Two things stand out. Everything up to ~128 columns costs the same ~130 ns — that is the per-instruction floor in our
+kernels (load the stationary tile, start the pipeline, drain into PSUM). And at 512 columns a matmul does 256× the
+work of the 2-column one for 2.6× the time. The AWS cost model says the same thing in cycles: a matmul costs about
+`max(N, 64)` array cycles, plus stationary loads that are only partly hidden.
+
+## What it means
+
+- **Count matmul instructions, not FLOPs.** Decode attention does tiny arithmetic in ~78,000 matmuls per step and
+  costs ~8 ms; the whole dense path does 90 GFLOPs in far fewer, wider matmuls and costs 11 ms.
+- **Make the moving operand wide.** Put the dimension with the most columns on the moving side; batch heads, pages or
+  tokens into the same matmul when the stationary operand is shared.
+- **Never leave a short tail.** A 544-token step ran every weight block as a 512-column matmul *plus* a 32-column one
+  — 86,000 extra ~130 ns instructions, about 11 ms.
+- **Transposes are matmuls too.** Each costs the same floor; avoid layouts that need one per page per head.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+Packed prefill keeps a whole talker step at ≤ 512 tokens (1 / 2 / 3 tiles of 128 + 32 decode rows), so every weight block
+is exactly one matmul per output tile.
+</InCode>

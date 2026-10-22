@@ -1,0 +1,56 @@
+---
+title: Gen2 gotchas
+short: things that bit me
+summary: Every NeuronCore-v2 / NKI / torch-neuronx surprise from porting Qwen3-TTS, with the workaround that shipped.
+order: 3
+related: [programming/tracing-and-compilation, kernels/cp-frame, programming/indirect-dma]
+---
+import T from '../../../components/inf2/T.astro';
+
+A list of everything that cost me time on inf2 (Neuron SDK 2.33, NKI 0.7, torch-neuronx 2.14). Some are documented
+limits, some are compiler gaps, some are my own bugs that the platform made easy to write.
+
+## Instructions and tiles
+
+| Gotcha | Workaround |
+| --- | --- |
+| Vector Engine instructions take at most 3 free dimensions | loop over one dimension, or reshape |
+| A matmul's stationary free size is ≤ 128 and its moving free size ≤ 512 (one PSUM bank) | tile; and keep steps at ≤ 512 tokens |
+| `accumulate=True` into a *slice* of a larger PSUM tile overwrote instead of accumulating | one PSUM tile per accumulation group |
+| GpSimd cannot read PSUM, and rejected fp32 tensor-tensor ops | evict with Vector or Scalar; use GpSimd for casts |
+| ScalarE reads PSUM only through `activation(op=copy)`, whose bias must be an immediate | per-partition bias on the Vector Engine |
+| `nc_match_replace8` with `dst_idx` is unimplemented on gen2 | `nc_find_index8` on an untouched copy |
+| `tensor_scalar_cumulative` compiled alone but failed to lower in a larger kernel | cumsum as transpose + triangular-ones matmul |
+| Scalar Engine `sin` only valid on [−π, π] | <T id="patterns/sin-range-reduction">range reduction</T> |
+
+## Memory and DMA
+
+| Gotcha | Workaround |
+| --- | --- |
+| A DMA into a strided SBUF view splits into tiny descriptors (13 GB/s) | stage through a contiguous tile, copy on chip |
+| Out-of-bounds padding ids are checked against the whole allocation, not your view | ids past the end of the entire stacked cache |
+| Dimension-major KV writes: 128 tiny descriptors per token (49 ms per 96-token step) | token-major cache, one scatter per layer |
+| `vector_select` page gathers ran at about half the speed of `scalar_offset` | one `scalar_offset` DMA per page |
+| 192 KiB per partition — a 544-token step overflowed SBUF | token-chunked linears and fused SwiGLU |
+
+## Compilation and tracing
+
+| Gotcha | Workaround |
+| --- | --- |
+| Static arguments are part of the kernel: a list of tensors passed as one kwarg became a static, value-keyed argument | pass tensors as separate arguments |
+| Every new shape compiles, including the eager ops around kernels | buckets; full end-to-end warm-up |
+| Eager indexing with a Python int (`t[row] = 0`) compiled a new op per row value | multiply by a keep-mask tensor |
+| NKI tracing is not thread-safe ("No backend set", "duplicate op name") | warm up engines one at a time |
+| The NEFF cache key needs a full trace: ~100 s per variant per process | `NKI_ENABLE_TRACE_CACHE=1` — see <T id="engine/cold-start-trace-cache">cold start</T> |
+| The trace cache served a stale kernel after an edit | add the kernel dir to `NKI_TRACE_CACHE_ROOTS`; key the cache dir by a source hash |
+| Profiling "the newest NEFF" picked a different, cached kernel | profile with an empty `TORCH_NEURONX_NEFF_CACHE_DIR` |
+
+## PyTorch and the runtime
+
+| Gotcha | Workaround |
+| --- | --- |
+| `torch.set_num_threads` in the serving thread made every compiled graph recompile (2.5 s stall) | set it once, before warm-up |
+| `torch._dynamo` automatic dynamic shapes recompiled graphs mid-traffic | `torch._dynamo.config.automatic_dynamic_shapes = False` |
+| One process grabs both NeuronCores by default | `NEURON_RT_VISIBLE_CORES` per process |
+| Timing without a device sync measures launch, not execution | `torch.neuron.synchronize()` |
+| No torchaudio wheel for torch 2.14 on Neuron | a stub module (only an unused tokenizer imported it) |

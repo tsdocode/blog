@@ -1,0 +1,36 @@
+---
+// Paged KV cache: per-stream block table -> token-major pages in HBM; one scalar_offset DMA per page.
+---
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="330" rx="12" />
+  <text class="d-label" x="30" y="32">BLOCK TABLES (HOST)</text>
+  <rect class="d-box" x="30" y="44" width="190" height="34" rx="6" />
+  <text class="d-mono" x="42" y="66">stream 0 → [ 7, 2 ]</text>
+  <rect class="d-box" x="30" y="86" width="190" height="34" rx="6" />
+  <text class="d-mono" x="42" y="108">stream 1 → [ 4 ]</text>
+  <rect class="d-box" x="30" y="128" width="190" height="34" rx="6" />
+  <text class="d-mono" x="42" y="150">stream 2 → [ 0, 5, 9 ]</text>
+  <text class="d-small" x="30" y="186">padding page ids = past the end</text>
+  <text class="d-small" x="30" y="202">of the whole cache → DMA skipped</text>
+
+  <text class="d-label" x="270" y="32">K CACHE IN HBM  [layer, block, 128 tokens, 8 heads, 128]</text>
+  <g>
+    <rect class="d-amber" x="270" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="282" y="108">b0</text>
+    <rect class="d-box" x="332" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="344" y="108">b1</text>
+    <rect class="d-accent" x="394" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="406" y="108">b2</text>
+    <rect class="d-box" x="456" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="468" y="108">b3</text>
+    <rect class="d-green" x="518" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="530" y="108">b4</text>
+    <rect class="d-amber" x="580" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="592" y="108">b5</text>
+    <rect class="d-box" x="642" y="44" width="56" height="118" rx="5" /><text class="d-mono" x="654" y="108">b6</text>
+  </g>
+  <text class="d-small" x="270" y="186">token-major: each token's K for one layer = one 2 KiB row (8 heads × 128 × bf16)</text>
+  <text class="d-small" x="270" y="202">a page = 128 rows = 256 KiB, contiguous → one DMA with scalar_offset = block id</text>
+
+  <text class="d-label" x="30" y="242">PER LAYER, PER STEP</text>
+  <rect class="d-cyan" x="30" y="254" width="330" height="56" rx="8" />
+  <text class="d-text" x="44" y="278">write: 1 scatter DMA</text>
+  <text class="d-small" x="44" y="296">this step's tokens on partitions, vector_offset = cache row</text>
+  <rect class="d-accent" x="380" y="254" width="350" height="56" rx="8" />
+  <text class="d-text" x="394" y="278">read: 1 gather DMA per page</text>
+  <text class="d-small" x="394" y="296">[128 keys on partitions, 8 heads × 128] into SBUF</text>
+</svg>

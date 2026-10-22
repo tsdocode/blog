@@ -1,0 +1,51 @@
+---
+title: Lockstep continuous batching
+short: one step = one frame
+summary: Every engine step produces one 80 ms audio frame for every active stream; new requests join at the next step. A step must take under 80 ms.
+order: 1
+related: [kernels/talker-step, kernels/cp-frame, engine/codec-chunking]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Qwen3-TTS produces audio at 12.5 frames per second: one frame of 16 codebook tokens is 80 ms of speech. The engine
+on each NeuronCore runs a simple loop in which **every step advances every active stream by one frame**, so a step
+has an 80 ms budget — finish faster and every stream plays in real time.
+
+<Stats items={[
+  { value: '32', label: 'stream slots per NeuronCore', note: 'TTS engine' },
+  { value: '80 ms', label: 'audio per step = the step budget', note: 'model' },
+  { value: '60 ms', label: 'mean step under 64-stream load', note: 'measured' },
+  { value: '0.79', label: 'real-time factor (p50) at 64 streams', note: 'measured' }
+]} />
+
+## One step
+
+1. **Admit** waiting requests into free slots, packing their prompts into 128-token tiles.
+2. **Talker** — one <T id="kernels/talker-step">fused kernel</T> for 32 decode tokens plus the packed prompts.
+3. **Host sampling** of codebook 0: the logits come back (`[tokens, 3072]`), then the suppress mask, an end-of-speech
+   block for the first 3 tokens, repetition penalty and top-k sampling, batched over streams.
+4. **Code predictor** — one <T id="kernels/cp-frame">cp_frame</T> launch fills codebooks 1–15 for every stream.
+5. **Codec** — every 2nd step, decode 2 pending frames per stream into audio (see
+   <T id="engine/codec-chunking">codec chunking</T>) and hand the PCM to each stream's HTTP response.
+
+## Where 60 ms goes
+
+Measured per step on one core under the 64-stream load test (host wall time; device work shows up in the phase that
+first waits for it):
+
+| Phase | ms per step |
+| --- | ---: |
+| Talker + output head (device) | ~20 |
+| Code predictor (device) | ~16 |
+| Codec, every 2nd step (averaged) | ~15 |
+| Host: batch build, sampling, sending audio | ~9.5 |
+| **Total** | **~60** |
+
+The host share used to be 12.5 ms: the Python loops building attention masks were vectorised (1–3.5 ms → 0.1–0.3 ms)
+and the sampler draws from the top-50 values only instead of a softmax over all 3,072 (3.2 → 0.9 ms).
+
+<InCode file="neuron/engine/neuron_engine.py">
+`NeuronTTSEngine.step()`. Per-phase timings are exposed live on each server's `/stats` endpoint.
+</InCode>

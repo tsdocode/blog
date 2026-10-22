@@ -1,0 +1,62 @@
+---
+title: NKI
+short: Neuron Kernel Interface
+summary: Python-embedded kernel language for NeuronCores — you place every tile in SBUF or PSUM and issue every engine instruction yourself.
+order: 1
+related: [programming/first-kernel, programming/tracing-and-compilation, hardware/neuroncore-v2]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+NKI (Neuron Kernel Interface) is how you write your own kernels for a NeuronCore. A kernel is a Python function
+decorated with `@nki.jit`. When it is called it is **traced** — executed symbolically — into a list of engine
+instructions, compiled into a NEFF binary, and launched on the device like any other op.
+
+The closest GPU analogue is not CUDA C++ but something like Triton with the training wheels removed: there are no
+threads or warps. You allocate tiles explicitly, move them with DMA, and call one function per hardware
+instruction.
+
+<Stats items={[
+  { value: '@nki.jit', label: 'decorator: a Python function becomes a device kernel', note: 'API' },
+  { value: 'nki.isa', label: 'one call per engine instruction', note: 'API' },
+  { value: 'nl.ndarray', label: 'explicit buffers: hbm, sbuf, psum', note: 'API' },
+  { value: 'static', label: 'shapes and loop bounds fixed at trace time', note: 'model' }
+]} />
+
+## The two layers of the API
+
+- **`nki.language` (`nl`)** — buffers, dtypes, loops: `nl.ndarray(shape, dtype, buffer=nl.sbuf)`,
+  `nl.static_range`, `nl.affine_range`.
+- **`nki.isa` (`nisa`)** — the instructions: `nisa.dma_copy`, `nisa.nc_matmul` (Tensor Engine),
+  `nisa.tensor_tensor` / `tensor_scalar` / `tensor_reduce` (Vector Engine), `nisa.activation` (Scalar Engine),
+  `nisa.iota`, `nisa.max8` and friends.
+
+Most `nisa` calls take an `engine=` argument or have a fixed engine, so you decide which of the four engines does
+each piece of work. The compiler schedules the four instruction streams and inserts the semaphores between them.
+
+## What you control, and what you do not
+
+You control: tile shapes and placement, the partition layout of every tensor, which engine runs each op, the order
+of DMAs, how much is resident in SBUF. You do not write synchronisation, register allocation or instruction
+scheduling — the compiler does that from your data dependencies.
+
+## Calling a kernel from PyTorch
+
+With torch-neuronx a kernel is called directly on `neuron` tensors and composes with eager PyTorch:
+
+```python
+x = torch.randn(2048, 32, dtype=torch.bfloat16).to("neuron")   # [features, tokens]
+y = rmsnorm_linear_t(x, norm_w, w_tiled)                        # traced + compiled on first call
+```
+
+The first call per distinct input shape (and per value of each static argument) traces and compiles; later calls
+reuse the NEFF. See <T id="programming/tracing-and-compilation">tracing and compilation</T>.
+
+<InCode file="neuron/kernels">
+The whole TTS hot path is 7 NKI kernel modules: the talker (`talker_kernels.py`), the code predictor
+(`cp_kernels.py`) and the codec (`codec_kernels.py`, `codec_front_kernels.py`), called from an ordinary Python
+engine loop.
+</InCode>
+
+Sources: [NKI documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html); Neuron SDK 2.33, NKI 0.7.
