@@ -1,0 +1,28 @@
+---
+import GuideLayout from '../../layouts/GuideLayout.astro';
+import { getGuideTree, entryHref } from '../../lib/guide';
+
+const { tree } = await getGuideTree();
+---
+<GuideLayout title="Inferentia2 Field Guide" description="The AWS Inferentia2 chip, explained from the silicon up: its NeuronCores and engines, how NKI kernels drive them, and how each idea maps onto a real streaming TTS server that runs 64 voices in real time on one inf2.xlarge.">
+  <p>
+    Inferentia2 is AWS's second-generation inference chip. Very few people have written about how it actually
+    works, so this guide explains it one component at a time, the way a kernel author sees it. Every entry is short,
+    links to its neighbours, and ends with where the idea shows up in
+    <a href="https://github.com/tsdocode/aws-inf2-qwen3-tts">a real Qwen3-TTS serving engine</a> built on the chip.
+  </p>
+  {tree.map((section) => (
+    <section>
+      <h2>{section.title}</h2>
+      <div class="guide-cards">
+        {section.entries.map((entry) => (
+          <a href={entryHref(entry.id)}>
+            {entry.data.short && <span class="mono">{entry.data.short}</span>}
+            <strong>{entry.data.title}</strong>
+            <span>{entry.data.summary}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+  ))}
+</GuideLayout>

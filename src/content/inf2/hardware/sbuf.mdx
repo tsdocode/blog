@@ -1,0 +1,60 @@
+---
+title: State Buffer
+short: SBUF
+summary: The 24 MiB on-chip scratchpad every engine works out of — 128 partitions × 192 KiB, managed entirely by your kernel.
+order: 7
+related: [programming/partition-and-free-axes, hardware/psum, hardware/dma]
+---
+import SbufDiagram from '../../../components/inf2/SbufDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+SBUF (State Buffer) is the NeuronCore's main working memory: 24 MiB of on-chip SRAM. There are **no caches**.
+Data reaches SBUF only when your kernel issues a <T id="hardware/dma">DMA</T> from HBM, stays exactly as long
+as your kernel keeps it, and goes back to HBM only when you write it out.
+
+<Stats items={[
+  { value: '24 MiB', label: 'per NeuronCore', note: 'AWS docs' },
+  { value: '128', label: 'partitions', note: 'AWS docs' },
+  { value: '192 KiB', label: 'per partition', note: 'AWS docs' },
+  { value: '0', label: 'hardware caches', note: 'AWS docs' }
+]} />
+
+<Diagram label="SBUF partitions and tiles" caption="SBUF is a 2-D memory: 128 partitions (rows), each a 192 KiB line addressed along the free axis. A tile occupies some partitions and a range of the free axis.">
+  <SbufDiagram />
+</Diagram>
+
+## Partitions
+
+SBUF is split into 128 **partitions**. Each engine instruction processes many partitions in parallel, the same
+access pattern in each — partition `p` feeds lane `p`. That makes the partition axis the parallel axis and the
+free axis (bytes within a partition) the sequential one. See
+<T id="programming/partition-and-free-axes">partition and free axes</T>.
+
+Two rules follow:
+
+- **Pick what goes on partitions.** For a matmul the contraction dimension must be on partitions; for a row-wise
+  softmax the rows must be. Kernels often keep the same data in different layouts for different steps.
+- **Crossing partitions is expensive.** The compute engines cannot move data between partitions except through the
+  <T id="hardware/tensor-engine">Tensor Engine</T> (a transpose is a matmul with the identity) or DMA.
+
+## Who can touch it
+
+DMA reads and writes SBUF; the Tensor Engine reads it; Vector, Scalar and GpSimd read and write it. SBUF can feed
+Vector, Scalar and Tensor at full bandwidth simultaneously; Vector and GpSimd cannot access it at the same time.
+
+## Budgeting 192 KiB per partition
+
+Everything a kernel keeps on chip must fit in 192 KiB per partition, and the compiler spills to HBM when it does not.
+For a 28-layer transformer step you cannot keep all weights resident, so the usual pattern is to stream weights
+block by block through SBUF while activations stay resident.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+The fused talker step keeps the token activations in SBUF across all 28 layers and streams the weights
+(2.8 GB per step) through it. With 544 tokens the kernel overflowed SBUF until its linears and SwiGLU were split into
+512-token chunks.
+</InCode>
+
+Source: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (memory hierarchy, SBUF).

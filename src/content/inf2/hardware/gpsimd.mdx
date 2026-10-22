@@ -1,0 +1,40 @@
+---
+title: GpSimd Engine
+short: GpSimd / Pool
+summary: Eight fully programmable 512-bit vector processors with their own local memory — the engine for anything the others cannot do.
+order: 6
+related: [hardware/vector-engine, hardware/dma]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+GpSimd is the general-purpose corner of the NeuronCore: **eight programmable processors**, each a 512-bit vector
+machine that can run arbitrary C/C++. Each one is wired to 16 <T id="hardware/sbuf">SBUF</T> partitions, so
+together they cover all 128.
+
+<Stats items={[
+  { value: '8', label: 'programmable cores', note: 'AWS docs' },
+  { value: '512-bit', label: 'SIMD per core (16 × fp32)', note: 'AWS docs' },
+  { value: '64 KiB', label: 'local memory per core', note: 'AWS docs' },
+  { value: '1.4 GHz', label: 'clock', note: 'AWS docs' }
+]} />
+
+## What it is used for
+
+- **Custom operators** and the long tail of ops the fixed-function engines do not have.
+- **Generating DMA descriptors at runtime** for some data-dependent transfers.
+- **A third pair of hands** for simple element-wise work (casts, iota, memset) when Vector and Scalar are busy.
+
+## Caveats on gen2
+
+GpSimd **cannot read PSUM**, so it cannot evict matmul results. In our kernels the compiler also rejected some fp32
+tensor-tensor operations on it. It also shares SBUF access with the Vector Engine — the two cannot use it at the
+same time — so moving work from Vector to GpSimd does not always help.
+
+<InCode file="neuron/kernels/codec_kernels.py">
+The codec's fp32 → bf16 casts are pinned to GpSimd (`CAST_ENGINE = nisa.engine.gpsimd`) to take them off the
+Vector Engine, which was the bottleneck at audio sample rate.
+</InCode>
+
+Source: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (GpSimd Engine).

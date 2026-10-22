@@ -1,0 +1,42 @@
+---
+// nc_matmul: stationary [K, M] is loaded into the 128x128 array, moving [K, N] streams through, out [M, N] in PSUM.
+---
+<svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="340" rx="12" />
+  <!-- stationary -->
+  <text class="d-label" x="30" y="34">STATIONARY [K, M]</text>
+  <rect class="d-accent" x="30" y="46" width="150" height="150" rx="6" />
+  <text class="d-small" x="44" y="128">loaded once</text>
+  <text class="d-small" x="44" y="144">(LoadStationary)</text>
+  <text class="d-mono" x="30" y="214">K ≤ 128, M ≤ 128</text>
+  <text class="d-mono" x="30" y="228">K = contraction,</text>
+  <text class="d-mono" x="30" y="242">on SBUF partitions</text>
+  <path class="d-flow" d="M180 121 H226" />
+
+  <!-- array -->
+  <text class="d-label" x="232" y="34">PE ARRAY 128 × 128</text>
+  <rect class="d-box" x="232" y="46" width="150" height="150" rx="6" />
+  <g class="d-line" stroke-opacity=".35">
+    <path d="M232 76 H382 M232 106 H382 M232 136 H382 M232 166 H382" />
+    <path d="M262 46 V196 M292 46 V196 M322 46 V196 M352 46 V196" />
+  </g>
+  <text class="d-mono" x="252" y="214">2.8 GHz, 1 MAC/PE/cycle</text>
+  <text class="d-mono" x="252" y="228">peak ≈ 92 TFLOPS bf16</text>
+
+  <!-- moving -->
+  <text class="d-label" x="30" y="282">MOVING [K, N]</text>
+  <text class="d-mono" x="30" y="298">K ≤ 128, N ≤ 512</text>
+  <rect class="d-green" x="232" y="258" width="380" height="56" rx="6" />
+  <text class="d-small" x="246" y="291">streams through, one column per cycle (MultiplyMoving)</text>
+  <path class="d-flow" d="M240 258 V200" />
+
+  <!-- psum -->
+  <path class="d-flow" d="M382 121 H430" />
+  <text class="d-label" x="436" y="34">OUTPUT IN PSUM  [M, N] fp32</text>
+  <rect class="d-amber" x="436" y="46" width="296" height="150" rx="6" />
+  <text class="d-small" x="452" y="104">out = stationaryᵀ @ moving</text>
+  <text class="d-small" x="452" y="124">accumulate=True adds into the bank</text>
+  <text class="d-small" x="452" y="144">N ≤ 512: one 2 KiB PSUM bank</text>
+  <text class="d-mono" x="452" y="178">partitions = M, free axis = N</text>
+  <text class="d-mono" x="436" y="226">cost ≈ max(N, 64) array cycles</text>
+</svg>

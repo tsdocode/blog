@@ -1,0 +1,7 @@
+---
+// Cross-link to another guide entry: <T id="hardware/sbuf">SBUF</T>
+import { entryHref } from '../../lib/guide';
+interface Props { id: string; }
+const { id } = Astro.props;
+---
+<a href={entryHref(id)}><slot /></a>

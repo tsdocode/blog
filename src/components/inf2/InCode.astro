@@ -1,0 +1,14 @@
+---
+// "In our TTS engine" callout: where a guide concept shows up in tsdocode/aws-inf2-qwen3-tts.
+interface Props {
+  file?: string;          // repo-relative path, e.g. "neuron/kernels/talker_kernels.py"
+  label?: string;
+}
+const { file, label = 'In our TTS engine' } = Astro.props;
+const href = file ? `https://github.com/tsdocode/aws-inf2-qwen3-tts/blob/main/${file}` : undefined;
+---
+<aside class="callout-code">
+  <span class="callout-label">{label}</span>
+  <div class="callout-body"><slot /></div>
+  {href && <a class="callout-file" href={href}>{file} ↗</a>}
+</aside>

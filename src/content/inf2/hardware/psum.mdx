@@ -1,0 +1,56 @@
+---
+title: Partial Sum Buffer
+short: PSUM
+summary: 2 MiB of fp32 accumulators next to the Tensor Engine — 8 banks of 2 KiB per partition, written only by matmuls.
+order: 8
+related: [hardware/tensor-engine, hardware/vector-engine, hardware/sbuf]
+---
+import PsumDiagram from '../../../components/inf2/PsumDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+PSUM (Partial Sum buffer) is where matmul results land. The <T id="hardware/tensor-engine">Tensor Engine</T>
+cannot write to SBUF; every `nc_matmul` writes — or accumulates — fp32 values into PSUM, and the Vector or Scalar
+Engine then copies the result back to SBUF.
+
+<Stats items={[
+  { value: '2 MiB', label: 'per NeuronCore', note: 'AWS docs' },
+  { value: '8 banks', label: 'per partition', note: 'AWS docs' },
+  { value: '2 KiB', label: 'per bank = 512 fp32', note: 'AWS docs' },
+  { value: 'fp32', label: 'accumulation, always', note: 'AWS docs' }
+]} />
+
+<Diagram label="PSUM banks" caption="Each partition's 16 KiB of PSUM is 8 banks of 512 fp32. One matmul writes one bank, which is why a moving tile is limited to 512 columns.">
+  <PsumDiagram />
+</Diagram>
+
+## Accumulation groups
+
+Each matmul either **overwrites** its bank or **accumulates** into it (`accumulate=True`). A chain of matmuls into
+one bank — for example the 16 `K`-blocks of a 2048-wide contraction — is an accumulation group. With 8 banks the
+Tensor Engine can have up to 8 groups in flight, so it starts the next block while the previous one is being
+evicted.
+
+## Who can touch it
+
+- Tensor Engine: write and accumulate only.
+- Vector and Scalar: read and write, but not at the same time.
+- GpSimd: no access.
+
+## Practical notes
+
+- **Evict straight into the next op.** A residual add, bias add or activation can read PSUM directly, so the eviction
+  copy and the next operation are one instruction.
+- **Give each accumulation its own tile.** In our kernels, `accumulate=True` into a *slice* of a larger PSUM tile
+  overwrote instead of accumulating; separate per-accumulation PSUM tiles fixed it.
+- **Fill whole banks.** Four `[128, 128]` matmuls written into the four quarters of one `[128, 512]` bank can then
+  be read back by a single Vector or Scalar instruction.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+The SwiGLU MLP reads gate and up projections straight out of PSUM and writes `silu(gate) · up` to SBUF in bf16 — the
+`[12288, tokens]` intermediate never exists at full width.
+</InCode>
+
+Source: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (PSUM).

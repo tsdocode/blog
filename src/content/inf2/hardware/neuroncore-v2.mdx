@@ -1,0 +1,65 @@
+---
+title: NeuronCore-v2
+short: NC-v2
+summary: One core = four specialised engines running four independent instruction streams around a software-managed scratchpad.
+order: 2
+related: [hardware/tensor-engine, hardware/sbuf, programming/nki]
+---
+import CoreDiagram from '../../../components/inf2/CoreDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+A NeuronCore is the unit you program. If you come from GPUs, the biggest mental shift is that it is **not** a
+sea of identical threads. It is four different engines, each good at one kind of work, each with its own
+instruction sequencer — and they run **at the same time**, on four separate instruction streams.
+
+<Diagram label="NeuronCore-v2 block diagram" caption="The four compute engines read and write the on-chip SBUF; only the Tensor Engine writes PSUM; DMA engines move data between HBM and SBUF. Hardware semaphores order the streams.">
+  <CoreDiagram />
+</Diagram>
+
+<Stats items={[
+  { value: '4', label: 'compute engines, 4 instruction streams', note: 'AWS docs' },
+  { value: '~92', label: 'bf16 TFLOPS (Tensor Engine)', note: 'AWS docs' },
+  { value: '24 MiB', label: 'SBUF scratchpad', note: 'AWS docs' },
+  { value: '2 MiB', label: 'PSUM accumulators', note: 'AWS docs' },
+  { value: '16', label: 'DMA engines', note: 'AWS docs' }
+]} />
+
+## The four engines
+
+| Engine | Good at | Lanes | Clock |
+| --- | --- | ---: | ---: |
+| <T id="hardware/tensor-engine">Tensor</T> | matrix multiply, transpose | 128×128 array | 2.8 GHz |
+| <T id="hardware/vector-engine">Vector</T> | ops with two inputs, reductions | 128 | 1.12 GHz |
+| <T id="hardware/scalar-engine">Scalar</T> | element-wise math, `exp` / `silu` / `rsqrt` | 128 | 1.4 GHz |
+| <T id="hardware/gpsimd">GpSimd</T> | anything else: 8 programmable cores | 128 (32-bit) | 1.4 GHz |
+
+## Four streams, synchronised by semaphores
+
+Each engine has a sequencer that fetches, decodes and issues its own instructions. A kernel compiles into four
+streams that run asynchronously. When an instruction on one engine needs a tile another engine produces, the
+compiler inserts a wait on a **hardware semaphore** — you never write the synchronisation yourself, but you pay
+for it: a chain of small dependent instructions bouncing between engines spends most of its time waiting.
+
+A fifth sequencer, the **sync engine**, mostly issues DMA transfers so that data movement never sits in a compute
+engine's queue.
+
+## What this means for kernels
+
+- **Overlap is the whole game.** The fastest kernels keep all engines busy at once: the Tensor Engine on the next
+  matmul while Vector evicts the previous result from <T id="hardware/psum">PSUM</T> and Scalar applies an
+  activation, with DMA already loading the next weights.
+- **Balance the engines.** If a profile shows Vector at 93% busy and Scalar at 8%, move work to Scalar (e.g.
+  copies via `activation(op=copy)`). This one change took our codec transformer from 4.0 to 3.3 ms.
+- **Long dependency chains are slow** even if every instruction is tiny: process several heads or tiles per
+  instruction instead of one at a time.
+
+<InCode file="neuron/kernels/codec_front_kernels.py">
+The codec front transformer's attention state copies were moved from the busy Vector Engine to the idle Scalar
+Engine (`nisa.activation(op=nl.copy)`), after a profile showed VectorE 93% / ScalarE 8%.
+</InCode>
+
+Sources: [NeuronCore-v2](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v2.html),
+[Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html).

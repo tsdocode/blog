@@ -1,0 +1,66 @@
+---
+title: DMA engines and descriptors
+short: DMA
+summary: 16 DMA engines per core move data between HBM and SBUF. What they cost depends on descriptor count and size, not just bytes.
+order: 10
+related: [hardware/hbm, hardware/sbuf, kernels/codec-front-transformer]
+---
+import DmaDiagram from '../../../components/inf2/DmaDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Every byte that enters or leaves a NeuronCore goes through a DMA engine. Each core has **16 of them**, each able to
+drive about 27 GiB/s, running in parallel with all the compute engines. A kernel's `nisa.dma_copy(dst, src)` becomes
+one or more DMA **transfers**, and each transfer is a list of **descriptors**: one per contiguous chunk of memory.
+
+<Stats items={[
+  { value: '16', label: 'DMA engines per NeuronCore', note: 'AWS docs' },
+  { value: '27 GiB/s', label: 'peak per DMA engine', note: 'AWS docs' },
+  { value: '≥ 32 KiB', label: 'transfer size for ideal bandwidth', note: 'AWS docs' },
+  { value: '2.9×', label: 'kernel slowdown from ~140-byte descriptors (11.6 vs 4.0 ms)', note: 'measured' }
+]} />
+
+## Descriptors are the cost
+
+A descriptor describes one contiguous run of bytes. Copying a `[128, N]` tile into SBUF needs at least one
+descriptor per partition, because partitions are separate memories. The guidance: make every contiguous run
+large — 4 KiB or more along the free axis, across all 128 partitions.
+
+The trap is that *the same number of bytes* can cost wildly different amounts. Writing into a strided slice of a
+wider SBUF tile, for example, breaks every partition's run into many short pieces:
+
+<Diagram label="Contiguous versus strided DMA destinations" caption="Same bytes, different descriptors. On the top, each partition receives one ~4.5 KiB run. On the bottom, the destination is a strided slice, so each partition receives B separate ~140-byte runs.">
+  <DmaDiagram />
+</Diagram>
+
+## Static vs dynamic
+
+On NeuronCore-v2, descriptors for static access patterns are generated ahead of time and stored in HBM. Accesses
+whose address depends on runtime data — a block id from a page table, a token id — use indirect addressing: a
+runtime scalar offset for the whole transfer (`scalar_offset`) or a per-partition offset (`vector_offset`). Both
+work for paged gathers and scatters, but each runtime-addressed transfer pays its own descriptor cost, so the trick
+is to make every runtime transfer large.
+
+## Practical rules
+
+1. **Lay out HBM tensors so each partition's data is one contiguous run**, even if that means a less obvious
+   tensor layout.
+2. **Never DMA into a strided view.** Load into a contiguous staging tile, then copy on chip — on-chip copies are cheap.
+3. **Batch runtime-addressed transfers**: one scatter for 128 tokens, not one per token.
+
+<InCode file="neuron/kernels/codec_front_kernels.py">
+The codec's front transformer loaded its attention state into `kall[:, :, 0:R]`, a strided slice of a wider tile:
+128 × B descriptors of ~140 B each, 13 GB/s. Staging through a contiguous `[128, B·R]` tile and copying on chip took
+the kernel from 11.6 ms to 4.0 ms.
+</InCode>
+
+<InCode file="neuron/kernels/talker_kernels.py" label="Also in our TTS engine">
+The talker's KV cache is stored token-major, so a new token's K and V for one layer is a single 2 KiB row, and
+all of a step's tokens are written with one `vector_offset` scatter per layer. An earlier dimension-major layout
+needed 128 tiny descriptors per token and cost 49 ms for a 96-token step.
+</InCode>
+
+Sources: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (data movement),
+[NKI DGE](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/deep-dives/nki-dge.html).

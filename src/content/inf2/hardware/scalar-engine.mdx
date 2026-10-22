@@ -1,0 +1,44 @@
+---
+title: Scalar Engine
+short: ScalarE / ACT
+summary: 128 lanes for one-input element-wise math — f(x·scale + bias) with hardware exp, silu, rsqrt, sin — plus a free running sum.
+order: 5
+related: [hardware/vector-engine, patterns/sin-range-reduction]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The Scalar Engine (the "activation" engine) handles operations where each output element depends on **one input
+element**: activations, exponentials, square roots, scaling, casting, copies. It has 128 lanes at 1.4 GHz and
+hardware implementations of the common non-linear functions.
+
+<Stats items={[
+  { value: '128', label: 'lanes, one per partition', note: 'AWS docs' },
+  { value: '1.4 GHz', label: 'clock', note: 'AWS docs' },
+  { value: 'f(x·s + b)', label: 'scale and bias fused for free', note: 'AWS docs' },
+  { value: '1', label: 'input tensor per instruction', note: 'AWS docs' }
+]} />
+
+## How it works
+
+Every instruction computes `func(in * scale + bias)` per element, where `scale` and `bias` can be per-partition
+values. The multiply-add is pipelined — it costs nothing extra. On NeuronCore-v2 an instruction can also keep a
+**running sum** of its outputs per partition, so a softmax's `exp` and the row sum of the exponentials come out of
+the same instruction.
+
+Things to know:
+
+- It reads **one** tensor per instruction. Anything that combines two tiles goes to the
+  <T id="hardware/vector-engine">Vector Engine</T>.
+- `sin` is only accurate on `[-π, π]`; larger arguments need range reduction first (see
+  <T id="patterns/sin-range-reduction">sin range reduction</T>).
+- The "copy" activation can read PSUM, which makes ScalarE a second engine for evicting matmul results when the
+  Vector Engine is busy.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+Packed-prefill softmax runs on ScalarE as `exp(scale · s − scale · max)`; the code predictor's RMSNorms use its `rsqrt`,
+and the codec's SnakeBeta activations use its `sin` after a Vector-Engine range reduction.
+</InCode>
+
+Source: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (Scalar Engine).

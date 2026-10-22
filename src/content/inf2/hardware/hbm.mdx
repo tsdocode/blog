@@ -1,0 +1,49 @@
+---
+title: High-Bandwidth Memory
+short: HBM
+summary: 32 GiB of device memory shared by both cores — 820 GB/s on paper, ~257 GB/s per core measured into SBUF.
+order: 9
+related: [hardware/dma, hardware/sbuf, performance/roofline]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+HBM is the chip's device memory: two stacks, 32 GiB in total, shared by both NeuronCores. Everything that does not
+fit on chip lives here — model weights, KV caches, codec state — and every kernel input and output starts and
+ends here. Compute engines never read HBM directly; <T id="hardware/dma">DMA</T> engines copy data into
+<T id="hardware/sbuf">SBUF</T> first.
+
+<Stats items={[
+  { value: '32 GiB', label: 'per chip, 2 stacks', note: 'AWS docs' },
+  { value: '820 GB/s', label: 'peak per chip', note: 'AWS docs' },
+  { value: '257 GB/s', label: 'HBM → SBUF, one core streaming', note: 'measured' },
+  { value: '~508 GB/s', label: 'both cores streaming at once', note: 'measured' }
+]} />
+
+## What you can actually get
+
+I measured sustained HBM → SBUF bandwidth with a kernel that streams a 67 MB tensor in large, contiguous tiles:
+**257 GB/s on one core** and about **508 GB/s with both cores streaming at once** — 62% of the 820 GB/s spec, and
+the cores barely slow each other down. For comparison, an NVIDIA L4 lists 300 GB/s for the whole GPU.
+
+That per-core number is the one that matters for decode, because a decode step must read every weight once:
+
+| Workload (per core) | Bytes per step | Floor at 257 GB/s | Measured |
+| --- | ---: | ---: | ---: |
+| Talker, 28 layers, dense part | 2.82 GB | 11.0 ms | 11.0 ms |
+| Talker KV cache, 32 streams | ~0.7 GB | ~2.7 ms | (inside attention) |
+| Code predictor, 16 depth steps | ~2.6 GB | ~10 ms | 14.3 ms per frame |
+
+## Why the spec is higher than what one core sees
+
+A core reaches HBM through its 16 DMA engines (27 GiB/s each), and the achieved rate depends heavily on how
+large and how contiguous each transfer is (see <T id="hardware/dma">DMA</T>). The full 820 GB/s is a
+chip-level figure for both cores and both stacks.
+
+<InCode file="neuron/bench/dma_both_cores.py">
+The bandwidth probe: a stream kernel looped over 67 MB; run one copy per core at the same time
+(`NEURON_RT_VISIBLE_CORES=0` and `=1`) to see whether the cores share bandwidth.
+</InCode>
+
+Sources: [Inferentia2 architecture](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/inferentia2.html); measurements on an inf2.xlarge, Neuron SDK 2.33.

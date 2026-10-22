@@ -1,0 +1,12 @@
+---
+// Figure wrapper for the hand-drawn, theme-aware SVG diagrams (classes in styles/guide.css).
+interface Props {
+  caption?: string;
+  label: string;
+}
+const { caption, label } = Astro.props;
+---
+<figure class="inf2-diagram" role="img" aria-label={label}>
+  <slot />
+  {caption && <figcaption>{caption}</figcaption>}
+</figure>

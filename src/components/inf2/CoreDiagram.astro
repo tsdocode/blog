@@ -1,0 +1,70 @@
+---
+// NeuronCore-v2: four engines with their own instruction streams around SBUF / PSUM, DMA to HBM, semaphores.
+---
+<svg viewBox="0 0 760 430" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="430" rx="12" />
+  <rect class="d-box" x="20" y="20" width="720" height="390" rx="14" />
+  <text class="d-label" x="38" y="44">NEURONCORE-V2</text>
+  <text class="d-mono" x="430" y="44">4 instruction streams, run in parallel</text>
+
+  <!-- engines row -->
+  <rect class="d-accent" x="40" y="62" width="160" height="96" rx="10" />
+  <text class="d-text" x="56" y="88">Tensor Engine</text>
+  <text class="d-small" x="56" y="108">128×128 systolic array</text>
+  <text class="d-small" x="56" y="124">matmul · transpose</text>
+  <text class="d-mono" x="56" y="146">2.8 GHz</text>
+
+  <rect class="d-green" x="216" y="62" width="160" height="96" rx="10" />
+  <text class="d-text" x="232" y="88">Vector Engine</text>
+  <text class="d-small" x="232" y="108">128 lanes, 2-input ops</text>
+  <text class="d-small" x="232" y="124">reduce · add · max · mul</text>
+  <text class="d-mono" x="232" y="146">1.12 GHz</text>
+
+  <rect class="d-cyan" x="392" y="62" width="160" height="96" rx="10" />
+  <text class="d-text" x="408" y="88">Scalar Engine</text>
+  <text class="d-small" x="408" y="108">128 lanes, f(x·s + b)</text>
+  <text class="d-small" x="408" y="124">exp · silu · rsqrt · sin</text>
+  <text class="d-mono" x="408" y="146">1.4 GHz</text>
+
+  <rect class="d-pink" x="568" y="62" width="152" height="96" rx="10" />
+  <text class="d-text" x="584" y="88">GpSimd</text>
+  <text class="d-small" x="584" y="108">8 programmable cores</text>
+  <text class="d-small" x="584" y="124">512-bit SIMD, C/C++</text>
+  <text class="d-mono" x="584" y="146">1.4 GHz</text>
+
+  <!-- arrows engines <-> memories -->
+  <path class="d-flow" d="M120 158 V196" />
+  <path class="d-flow" d="M120 196 V158" />
+  <path class="d-line" d="M296 158 V196 M472 158 V196 M644 158 V196" />
+
+  <!-- SBUF -->
+  <rect class="d-amber" x="40" y="196" width="512" height="70" rx="10" />
+  <text class="d-text" x="56" y="224">SBUF · 24 MiB on-chip scratchpad</text>
+  <text class="d-small" x="56" y="246">128 partitions × 192 KiB · software-managed, no caches</text>
+  <!-- PSUM -->
+  <rect class="d-accent" x="568" y="196" width="152" height="70" rx="10" />
+  <text class="d-text" x="584" y="224">PSUM · 2 MiB</text>
+  <text class="d-small" x="584" y="246">matmul accumulators</text>
+  <path class="d-flow" d="M120 158 C120 180 600 170 640 196" />
+
+  <!-- sync + DMA -->
+  <rect class="d-box" x="40" y="290" width="250" height="96" rx="10" />
+  <text class="d-text" x="56" y="316">Sync engine + semaphores</text>
+  <text class="d-small" x="56" y="336">hardware semaphores order the</text>
+  <text class="d-small" x="56" y="352">four streams (compiler-inserted)</text>
+  <text class="d-small" x="56" y="368">and kick off DMA transfers</text>
+
+  <rect class="d-cyan" x="306" y="290" width="246" height="96" rx="10" />
+  <text class="d-text" x="322" y="316">16 DMA engines</text>
+  <text class="d-small" x="322" y="336">HBM ⇄ SBUF, 27 GiB/s each</text>
+  <text class="d-small" x="322" y="352">gather / scatter by descriptors</text>
+  <text class="d-mono" x="322" y="372">measured 257 GB/s / core</text>
+  <path class="d-flow" d="M429 290 V266" />
+
+  <rect class="d-amber" x="568" y="290" width="152" height="96" rx="10" />
+  <text class="d-text" x="584" y="316">HBM</text>
+  <text class="d-small" x="584" y="336">shared by both cores</text>
+  <text class="d-small" x="584" y="352">weights, KV cache,</text>
+  <text class="d-small" x="584" y="368">activations in/out</text>
+  <path class="d-flow" d="M552 338 H568" />
+</svg>

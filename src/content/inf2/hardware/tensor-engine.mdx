@@ -1,0 +1,66 @@
+---
+title: Tensor Engine
+short: TensorE / PE array
+summary: A 128×128 systolic array at 2.8 GHz. One operand stays in the array ("stationary"), the other streams through ("moving").
+order: 3
+related: [hardware/psum, hardware/sbuf, performance/matmul-cost]
+---
+import MatmulDiagram from '../../../components/inf2/MatmulDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The Tensor Engine is where the FLOPs are. It is a **systolic array** of 128 × 128 processing elements (PEs).
+Every PE does one multiply-accumulate per cycle at 2.8 GHz, so the array peaks at
+128 × 128 × 2 FLOPs × 2.8 GHz ≈ **92 bf16 TFLOPS** per core.
+
+<Stats items={[
+  { value: '128 × 128', label: 'processing elements', note: 'AWS docs' },
+  { value: '2.8 GHz', label: 'array clock (2.5× the Vector Engine)', note: 'AWS docs' },
+  { value: '~92 TFLOPS', label: 'bf16 / fp16 / fp8 / tf32 peak per core', note: 'AWS docs' },
+  { value: '~23 TFLOPS', label: 'fp32 inputs (4× slower)', note: 'AWS docs' },
+  { value: '~130 ns', label: 'per small matmul in our kernels', note: 'measured' }
+]} />
+
+<Diagram label="Stationary and moving operands of nc_matmul" caption="A matmul is two instructions: LoadStationary puts a [K, M] tile into the array, MultiplyMoving streams a [K, N] tile through it and writes [M, N] into a PSUM bank. K is always the partition axis.">
+  <MatmulDiagram />
+</Diagram>
+
+## Stationary and moving
+
+`nc_matmul(dst, stationary, moving)` computes `dst = stationaryᵀ @ moving`:
+
+- **stationary** `[K, M]` — loaded into the array once; `K ≤ 128` (partitions), `M ≤ 128`.
+- **moving** `[K, N]` — streamed through column by column; `N ≤ 512`.
+- **dst** `[M, N]` — always fp32, written into one <T id="hardware/psum">PSUM</T> bank (2 KiB = 512 fp32 per partition).
+
+The contraction dimension `K` must sit on the SBUF partition axis of both operands. This is why NKI kernels keep
+activations **transposed** — `[features on partitions, tokens on the free axis]` — so a weight tile can be the
+stationary operand and a block of tokens the moving one, with no reshuffling between layers.
+
+Swapping the two operands gives you the transposed result. A transpose is literally a matmul against the
+identity matrix — the Tensor Engine is the main way data crosses partitions.
+
+## What it costs
+
+The array is deeply pipelined, so what matters is how often it can start a new instruction:
+
+- A matmul costs roughly **max(N, 64) array cycles** when the stationary tile is reused. Moving tiles narrower
+  than 64 columns waste the array.
+- Loading a new stationary tile is extra work, partly hidden by a background load during the previous matmul.
+- fp32 inputs cost about 4×; bf16, fp16, fp8 and tf32 all run at the same rate (fp8 saves bytes, not time).
+
+In practice, in our kernels a small matmul cost about **130 ns** no matter how small it was, and a full
+`128 × 128 × 512` one about 345 ns. The best microbenchmark I ran reached about half of the 92 TFLOPS peak; that
+benchmark accumulated every matmul into a single PSUM bank, and getting closer to peak needs back-to-back
+`128 × 512` moving tiles across several banks. The lesson that shaped every kernel: **issue fewer, wider
+matmuls** — see <T id="performance/matmul-cost">the matmul cost model</T>.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+Decode attention issues about 78,000 tiny matmuls per step (a transpose, Q·Kᵀ and P·V per page and head, each with
+only 2 moving columns) — the Tensor Engine is 70% busy doing very little arithmetic. Prefill tokens, by contrast,
+are packed into 128-token tiles so each matmul streams 128–512 columns.
+</InCode>
+
+Sources: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (Tensor Engine, cost model).

@@ -1,0 +1,51 @@
+---
+title: Vector Engine
+short: VectorE / DVE
+summary: 128 lanes for operations that combine several inputs — element-wise between two tiles, reductions, comparisons — at 1.12 GHz.
+order: 4
+related: [hardware/scalar-engine, hardware/sbuf, hardware/psum]
+---
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+The Vector Engine handles operations where an output depends on **more than one input element**: adding two
+tiles, a max over the free axis, a mask, a comparison, a reduction. It has 128 parallel lanes, one per
+<T id="hardware/sbuf">SBUF</T> partition, each walking along the free axis of its partition.
+
+<Stats items={[
+  { value: '128', label: 'lanes, one per partition', note: 'AWS docs' },
+  { value: '1.12 GHz', label: 'clock', note: 'AWS docs' },
+  { value: '~N cycles', label: 'one-input op over N elements (~2N for two inputs)', note: 'AWS docs' },
+  { value: '~100 cycles', label: 'fixed overhead when N is small or ops depend on each other', note: 'AWS docs' }
+]} />
+
+## How it works
+
+- Math is done in **fp32** internally; casting from bf16 on the way in and back on the way out is free.
+- The parallel axis must be the **partition axis**. Lanes cannot see each other's data, except for limited
+  shuffles and 32 × 32 transposes inside groups of 32 partitions.
+- It reads <T id="hardware/psum">PSUM</T> directly, which makes it the natural engine to evict matmul results
+  (bias add, residual add, mask add straight out of the accumulator).
+- Using fewer than 128 partitions does not make an instruction cheaper — a `[32, N]` op costs the same as a
+  `[128, N]` op. Fill all 128 lanes.
+
+## What this means for kernels
+
+The cost is linear in the free-axis length, plus a fixed overhead per instruction. Two consequences:
+
+1. **Wide is cheap, many is expensive.** One op over `[128, 4 × 128]` costs much less than four ops over
+   `[128, 128]`, because the fixed overhead is paid once.
+2. **It is easy to make the Vector Engine the bottleneck** — it is the slowest-clocked engine, and every
+   softmax, mask and residual lands on it. Offload what you can: element-wise single-input work belongs on the
+   <T id="hardware/scalar-engine">Scalar Engine</T>, casts can go to <T id="hardware/gpsimd">GpSimd</T>.
+
+Vector and GpSimd share SBUF access ports and cannot use them at the same time; Vector and Scalar likewise cannot
+read PSUM at the same time.
+
+<InCode file="neuron/kernels/talker_kernels.py">
+Packed-prefill attention processes 4 heads per pass: the mask add, row max, exp, normalisation and PSUM evictions are
+each one `[128, 4 × 128]` instruction instead of four `[128, 128]` ones.
+</InCode>
+
+Source: [Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html) (Vector Engine).

@@ -1,0 +1,83 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import '../styles/guide.css';
+import { getGuideTree, entryHref, guideBase, SECTIONS } from '../lib/guide';
+
+interface Props {
+  title: string;
+  description: string;
+  currentId?: string;          // entry id, e.g. "hardware/sbuf"; undefined on the guide home
+  short?: string;
+  related?: string[];
+}
+
+const { title, description, currentId, short, related = [] } = Astro.props;
+const { tree, flat } = await getGuideTree();
+const index = currentId ? flat.findIndex((entry) => entry.id === currentId) : -1;
+const prev = index > 0 ? flat[index - 1] : undefined;
+const next = index >= 0 && index < flat.length - 1 ? flat[index + 1] : index < 0 ? flat[0] : undefined;
+const sectionId = currentId?.split('/')[0];
+const sectionTitle = SECTIONS.find((section) => section.id === sectionId)?.title;
+const relatedEntries = related.map((id) => flat.find((entry) => entry.id === id)).filter(Boolean);
+const home = guideBase();
+---
+<BaseLayout title={currentId ? `${title} · Inferentia2 Field Guide` : title} description={description} type={currentId ? 'article' : 'website'}>
+  <div class="shell guide">
+    <details class="guide-nav-mobile">
+      <summary class="mono">Table of contents</summary>
+      <nav aria-label="Inferentia2 field guide">
+        {tree.map((section) => (
+          <div class="guide-group">
+            <span class="guide-group-title mono">{section.title}</span>
+            <ul>{section.entries.map((entry) => <li><a class:list={['mono', { current: entry.id === currentId }]} href={entryHref(entry.id)}>{entry.data.title}</a></li>)}</ul>
+          </div>
+        ))}
+      </nav>
+    </details>
+
+    <aside class="guide-sidebar" aria-label="Inferentia2 field guide">
+      <a class="guide-home mono" href={home}><span class="guide-prompt">$</span> inf2 --field-guide</a>
+      <nav>
+        {tree.map((section) => (
+          <details class="guide-group" open={!currentId || section.id === sectionId}>
+            <summary class="guide-group-title mono">{section.title}</summary>
+            <ul>
+              {section.entries.map((entry) => (
+                <li>
+                  <a class:list={['guide-link', { current: entry.id === currentId }]} href={entryHref(entry.id)} aria-current={entry.id === currentId ? 'page' : undefined}>
+                    <span class="guide-link-title">{entry.data.title}</span>
+                    {entry.data.short && <span class="guide-link-short mono">{entry.data.short}</span>}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ))}
+      </nav>
+    </aside>
+
+    <article class="guide-main">
+      {currentId && (
+        <div class="guide-path mono"><a href={home}>inf2</a><span>/</span>{sectionTitle}</div>
+      )}
+      <header class="guide-header">
+        <h1>{title}</h1>
+        {short && <span class="guide-short mono">{short}</span>}
+        <p class="dek">{description}</p>
+      </header>
+      <div class="article-body guide-body"><slot /></div>
+
+      {relatedEntries.length > 0 && (
+        <section class="guide-related">
+          <span class="toc-kicker">Related</span>
+          <ul>{relatedEntries.map((entry) => <li><a href={entryHref(entry!.id)}><strong>{entry!.data.title}</strong><span>{entry!.data.summary}</span></a></li>)}</ul>
+        </section>
+      )}
+
+      <nav class="guide-pager" aria-label="Previous and next entries">
+        {prev ? <a class="guide-prev" href={entryHref(prev.id)}><span class="mono">← prev</span>{prev.data.title}</a> : <span />}
+        {next && <a class="guide-next" href={entryHref(next.id)}><span class="mono">next →</span>{next.data.title}</a>}
+      </nav>
+    </article>
+  </div>
+</BaseLayout>

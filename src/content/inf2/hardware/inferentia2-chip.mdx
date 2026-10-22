@@ -1,0 +1,72 @@
+---
+title: Inferentia2 chip
+short: Inf2
+summary: AWS's second-generation inference accelerator — two NeuronCore-v2, 32 GiB of HBM, 190 bf16 TFLOPS per chip.
+order: 1
+related: [hardware/neuroncore-v2, hardware/hbm, hardware/dma]
+---
+import ChipDiagram from '../../../components/inf2/ChipDiagram.astro';
+import Diagram from '../../../components/inf2/Diagram.astro';
+import Stats from '../../../components/inf2/Stats.astro';
+import InCode from '../../../components/inf2/InCode.astro';
+import T from '../../../components/inf2/T.astro';
+
+Inferentia2 is the chip inside AWS's `inf2` instances. Think of it less as "a GPU from AWS" and more as two
+independent processors that happen to share a package and a pool of memory: each half is a
+<T id="hardware/neuroncore-v2">NeuronCore-v2</T>, with its own engines, its own on-chip memory and its own
+instruction streams. A kernel runs on one NeuronCore; the chip's two cores never share SBUF.
+
+<Stats items={[
+  { value: '2', label: 'NeuronCore-v2 per chip', note: 'AWS docs' },
+  { value: '190', label: 'bf16 / fp16 / fp8 TFLOPS per chip (95 per core)', note: 'AWS docs' },
+  { value: '32 GiB', label: 'HBM, in 2 stacks', note: 'AWS docs' },
+  { value: '820 GB/s', label: 'HBM bandwidth per chip', note: 'AWS docs' },
+  { value: '~508 GB/s', label: 'HBM → on-chip, both cores streaming', note: 'measured' },
+  { value: '32', label: 'DMA engines (16 per core)', note: 'AWS docs' }
+]} />
+
+<Diagram label="Inferentia2 chip block diagram" caption="One chip: two NeuronCores fed by a shared DMA fabric from two HBM stacks. Collective cores and NeuronLink only matter on the multi-chip instances (inf2.24xlarge / 48xlarge).">
+  <ChipDiagram />
+</Diagram>
+
+## What is on the chip
+
+- **Two NeuronCore-v2.** Each one is a full accelerator: a 128×128 <T id="hardware/tensor-engine">Tensor Engine</T>,
+  <T id="hardware/vector-engine">Vector</T>, <T id="hardware/scalar-engine">Scalar</T> and
+  <T id="hardware/gpsimd">GpSimd</T> engines, 24 MiB of <T id="hardware/sbuf">SBUF</T> and 2 MiB of
+  <T id="hardware/psum">PSUM</T>.
+- **HBM.** 32 GiB shared by both cores. Model weights, KV caches and every kernel's inputs and outputs live here.
+- **DMA engines.** 32 of them move data between HBM and each core's SBUF, in parallel with compute.
+- **Collective cores and NeuronLink-v2.** Hardware for AllReduce / AllGather between chips. A single-chip
+  `inf2.xlarge` has no NeuronLink, so for one-chip serving you can ignore them.
+
+The peak numbers are per chip: 380 INT8 TOPS, 190 TFLOPS for bf16 / fp16 / fp8 / tf32 and 47.5 TFLOPS for fp32.
+On this generation fp8 runs at the same matmul rate as bf16 — it halves weight bytes, not compute time.
+
+## The instance family
+
+| Instance | Chips | vCPUs | Host RAM | Device memory |
+| --- | ---: | ---: | ---: | ---: |
+| inf2.xlarge | 1 | 4 | 16 GiB | 32 GiB |
+| inf2.8xlarge | 1 | 32 | 128 GiB | 32 GiB |
+| inf2.24xlarge | 6 | 96 | 384 GiB | 192 GiB |
+| inf2.48xlarge | 12 | 192 | 768 GiB | 384 GiB |
+
+The `inf2.xlarge` is the interesting one for small-model serving: one chip, a tiny host (4 vCPUs, 16 GiB),
+and a price in the same range as a single small GPU instance.
+
+## Why it is underrated
+
+The silicon is not small: 820 GB/s of HBM bandwidth and 190 dense bf16 TFLOPS per chip. What it lacks is
+the CUDA ecosystem — there is no cuBLAS / FlashAttention / CUDA Graphs equivalent you can just import. You get a
+compiler (good for standard transformer graphs) and <T id="programming/nki">NKI</T> for everything else, and the
+rest of this guide is about what it takes to use the second one well.
+
+<InCode file="neuron/engine/start_server.sh">
+The TTS server runs one process per NeuronCore (`NEURON_RT_VISIBLE_CORES=0` and `=1`), each serving 32 streams,
+behind a small router — the two cores are treated as two independent accelerators, exactly as the hardware is.
+</InCode>
+
+Sources: AWS Neuron docs — [Inferentia2 architecture](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/inferentia2.html),
+[Inf2 instances](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/inf2-arch.html),
+[Trainium / Inferentia2 architecture for NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/architecture/trainium_inferentia2_arch.html).

@@ -1,0 +1,27 @@
+---
+// DMA descriptors: contiguous rows (one big descriptor per partition) vs a strided destination (many tiny ones).
+---
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="300" rx="12" />
+  <text class="d-label" x="30" y="32">GOOD: ONE 4.5 KiB DESCRIPTOR PER PARTITION</text>
+  <rect class="d-amber" x="30" y="46" width="150" height="80" rx="6" />
+  <text class="d-small" x="44" y="80">HBM, contiguous</text>
+  <text class="d-mono" x="44" y="100">[pair][128][B·R]</text>
+  <path class="d-flow" d="M180 86 H240" />
+  <rect class="d-green" x="240" y="46" width="200" height="80" rx="6" />
+  <g class="d-line" stroke-opacity=".35"><path d="M240 66 H440 M240 86 H440 M240 106 H440" /></g>
+  <text class="d-small" x="452" y="74">128 descriptors · ~4.5 KiB each</text>
+  <text class="d-small" x="452" y="94">near full DMA bandwidth</text>
+
+  <text class="d-label" x="30" y="168">BAD: STRIDED SBUF DESTINATION</text>
+  <rect class="d-amber" x="30" y="182" width="150" height="80" rx="6" />
+  <text class="d-small" x="44" y="216">HBM, same bytes</text>
+  <path class="d-flow" d="M180 222 H240" />
+  <rect class="d-pink" x="240" y="182" width="200" height="80" rx="6" />
+  <g class="d-line" stroke-opacity=".45">
+    <path d="M250 182 V262 M262 182 V262 M274 182 V262 M286 182 V262 M298 182 V262 M310 182 V262 M322 182 V262 M334 182 V262 M346 182 V262 M358 182 V262 M370 182 V262 M382 182 V262 M394 182 V262 M406 182 V262 M418 182 V262 M430 182 V262" />
+  </g>
+  <text class="d-small" x="452" y="210">writing into tile[:, :, 0:R] of a wider tile</text>
+  <text class="d-small" x="452" y="230">splits every row: 128 × B descriptors of ~140 B</text>
+  <text class="d-mono" x="452" y="252">13 GB/s: 11.6 ms kernel vs 4.0 ms</text>
+</svg>

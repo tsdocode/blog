@@ -1,0 +1,29 @@
+---
+// PSUM: 128 partitions x 16 KiB = 8 banks of 2 KiB (512 fp32) per partition; TensorE writes, Vector/Scalar evict.
+---
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="280" rx="12" />
+  <text class="d-label" x="30" y="32">PSUM = 128 PARTITIONS × 8 BANKS × 2 KiB</text>
+  <g>
+    <rect class="d-accent" x="30" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="38" y="118">bank 0</text>
+    <text class="d-mono" x="38" y="136">512 fp32</text>
+    <rect class="d-accent" x="118" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="126" y="118">bank 1</text>
+    <rect class="d-box" x="206" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="214" y="118">bank 2</text>
+    <rect class="d-box" x="294" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="302" y="118">bank 3</text>
+    <rect class="d-box" x="382" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="390" y="118">bank 4</text>
+    <rect class="d-box" x="470" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="478" y="118">bank 5</text>
+    <rect class="d-box" x="558" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="566" y="118">bank 6</text>
+    <rect class="d-box" x="646" y="48" width="80" height="150" rx="6" />
+    <text class="d-small" x="654" y="118">bank 7</text>
+  </g>
+  <text class="d-small" x="30" y="222">Each matmul writes one bank: up to 512 fp32 columns. 8 banks = up to 8 accumulation groups in flight,</text>
+  <text class="d-small" x="30" y="240">so the Tensor Engine keeps going while Vector / Scalar copy finished banks back to SBUF.</text>
+  <text class="d-mono" x="30" y="262">TensorE: write / accumulate only · Vector + Scalar: read + write (not at the same time) · GpSimd: no access</text>
+</svg>

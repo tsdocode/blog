@@ -1,0 +1,32 @@
+---
+// SBUF: 128 partitions (rows) x 192 KiB (free axis); an engine instruction touches all partitions in lockstep.
+---
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg">
+  <rect class="d-bg" x="0" y="0" width="760" height="300" rx="12" />
+  <text class="d-label" x="30" y="32">SBUF = 128 PARTITIONS × 192 KiB</text>
+  <text class="d-mono" x="470" y="32">free axis (bytes within a partition) →</text>
+  <g>
+    <rect class="d-box" x="70" y="46" width="660" height="200" rx="8" />
+    <!-- partition rows -->
+    <g class="d-line" stroke-opacity=".3">
+      <path d="M70 71 H730 M70 96 H730 M70 121 H730 M70 146 H730 M70 171 H730 M70 196 H730 M70 221 H730" />
+    </g>
+    <text class="d-mono" x="22" y="63">p0</text>
+    <text class="d-mono" x="22" y="88">p1</text>
+    <text class="d-mono" x="22" y="113">p2</text>
+    <text class="d-mono" x="22" y="138">⋮</text>
+    <text class="d-mono" x="14" y="238">p127</text>
+    <!-- a tile -->
+    <rect class="d-accent" x="150" y="48" width="200" height="196" rx="4" />
+    <text class="d-text" x="166" y="140">tile [128, N]</text>
+    <text class="d-small" x="166" y="160">one instruction processes</text>
+    <text class="d-small" x="166" y="176">all 128 rows in parallel</text>
+    <!-- another tile -->
+    <rect class="d-green" x="380" y="48" width="120" height="96" rx="4" />
+    <text class="d-small" x="390" y="100">tile [64, M]</text>
+    <rect class="d-amber" x="530" y="148" width="170" height="96" rx="4" />
+    <text class="d-small" x="540" y="200">weights block, resident</text>
+  </g>
+  <text class="d-small" x="70" y="272">Partition axis = parallel (128 lanes per engine). Free axis = time (elements walked per cycle).</text>
+  <text class="d-small" x="70" y="290">Data moves between partitions only through the Tensor Engine (matmul / transpose) or DMA.</text>
+</svg>

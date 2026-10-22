@@ -1,0 +1,10 @@
+---
+// Key-number grid. items: [{ value: "24 MiB", label: "on-chip SBUF per core", note: "spec" }]
+interface Props {
+  items: { value: string; label: string; note?: string }[];
+}
+const { items } = Astro.props;
+---
+<div class="stat-grid">
+  {items.map((item) => <div class="stat"><strong>{item.value}</strong><span>{item.label}</span>{item.note && <small>{item.note}</small>}</div>)}
+</div>
