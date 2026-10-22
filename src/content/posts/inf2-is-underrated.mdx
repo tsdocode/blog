@@ -146,12 +146,12 @@ op           count   HBM GB   share
 upstream model code: on non-CUDA devices, each depth step writes its new K and V into the cache **in place** (left).
 The fix is on the right:
 
-<CodeCompare before="Before · upstream components.py" after="After · neuron/proto/cp_step_graph.py">
+<CodeCompare before="Before · upstream components.py" after="After · cp_step_graph.py (names aligned)">
 <div slot="before">
 
 ```python
-# one in-place slice write per layer, per depth
-# step (unrolled 16x into one graph)
+# in-place slice write, per layer and depth step
+# (16 steps unrolled into one compiled graph)
 kv_cache[layer_index, :, 0,
          cache_pos:valid_length].copy_(key)
 kv_cache[layer_index, :, 1,
@@ -165,32 +165,44 @@ all_keys = kv_cache[layer_index, :, 0,
 
 ```python
 # one reusable step graph; step is a tensor input
-# GROUPS = 16: which slot this step writes,
-# and which slots attention may read
-slot = (torch.arange(GROUPS, device=x.device)
-        == step).view(1, GROUPS, 1, 1)
-visible = (torch.arange(GROUPS, device=x.device)
-           <= step).view(1, 1, 1, GROUPS)
+slot    = (torch.arange(16) == step).view(1, 16, 1, 1)
+visible = (torch.arange(16) <= step).view(1, 1, 1, 16)
 ...
-# new cache = old cache with this slot replaced
-kl = torch.where(slot, k.unsqueeze(1), kv[li, :, 0])
-vl = torch.where(slot, v.unsqueeze(1), kv[li, :, 1])
+# new cache = old cache, this step's slot replaced
+new_key_cache = torch.where(
+    slot, key.unsqueeze(1),
+    kv_cache[layer_index, :, 0])
+new_value_cache = torch.where(
+    slot, value.unsqueeze(1),
+    kv_cache[layer_index, :, 1])
 # returned as an output, never written in place
-new_kv.append(torch.stack((kl, vl), 1))
+new_kv_cache.append(
+    torch.stack((new_key_cache, new_value_cache), 1))
 ```
 
 </div>
 </CodeCompare>
 
-A compiled graph is functional — it cannot update one slot of a buffer in place — so each `copy_` became a `scatter`
-that produced a whole new cache. The numbers agree: 12.2 GB / 320 ≈ 38 MB per scatter, while the entire cache is
-about 21 MB (5 layers × 32 streams × K/V × 16 slots × 8 heads × 128 × 2 bytes) — every write read and rewrote
-essentially all of it.
+The right side uses the left side's names (the file calls them `kv`, `li`, `k`, `v`, `kl`, `vl`, and `GROUPS = 16`).
 
-The fix compiles **one** depth step instead of 16, takes the step index as a tensor input so the same graph is reused
-for every step, and writes the new slot with a mask instead of an in-place slice. `torch.where` is an ordinary
-element-wise op the compiler streams through once, and the graph returns the new cache instead of mutating its input. Compile time dropped from 567 s to 26 s and the frame from **73.5 to 32.1 ms** — which
-made the next bottleneck visible.
+**Why not in place?** If you come from PyTorch with CUDA graphs this looks backwards: there you *must* write caches in
+place, into buffers allocated up front, because a CUDA graph replays kernels at fixed memory addresses. And on a GPU that
+in-place `copy_` is a tiny kernel that writes only the one slot.
+
+A graph compiled for Neuron is different. `torch.compile` lowers it to HLO, a **functional** representation with no way
+to modify part of a buffer, so each in-place `copy_` is rewritten as a `scatter` that produces a whole new cache. The Neuron compiler then lowered
+each scatter as a read and rewrite of essentially the entire buffer: 12.2 GB / 320 ≈ 38 MB per scatter, for a cache of
+about 21 MB (5 layers × 32 streams × K/V × 16 slots × 8 heads × 128 × 2 bytes) — and there were 20 scatters per depth
+step.
+
+The `torch.where` version *also* writes a complete new cache — but **once per step**, as a plain element-wise op that
+the compiler streams through in large contiguous tiles, returned as a graph output instead of mutating an input.
+Profile 2 below shows exactly that: 23 MB written per step, about one cache. Per-step HBM traffic dropped from about
+970 MB to about 217 MB, compile time from 567 s to 26 s, and the frame from **73.5 to 32.1 ms**.
+
+And the final answer was in place after all: in the hand-written NKI kernel, each step DMAs its new K/V straight into
+its slot of the cache (`nisa.dma_copy(dst=kv[layer, 0, :, step, :, :], ...)`) — touching only that slot, just like
+the GPU kernel. In place is not the problem; in place *inside a compiled graph* is.
 
 ### Profile 2 — the code predictor, one reusable step graph
 
